@@ -1,0 +1,844 @@
+import os
+import sys
+import json
+import logging
+from typing import Dict, List, Any, Optional, Literal, Union
+from datetime import datetime
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from pathlib import Path
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
+from io import BytesIO
+from fastapi.responses import StreamingResponse, JSONResponse
+from dotenv import load_dotenv
+from PIL import Image, ImageDraw, ImageFont
+import textwrap
+import tempfile
+import requests
+from openai import OpenAI
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging to only show errors
+logging.basicConfig(
+    level=logging.ERROR,  # Only show ERROR level logs and above
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[logging.StreamHandler()]
+)
+
+# Set logging level for all third-party libraries to ERROR
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("peft").setLevel(logging.ERROR)
+logging.getLogger("torch").setLevel(logging.ERROR)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
+logging.getLogger("httpx").setLevel(logging.ERROR)
+
+# Get logger for this module - will also use ERROR level from the basicConfig
+logger = logging.getLogger(__name__)
+
+# Global variables to cache the model and tokenizer
+MODEL = None
+TOKENIZER = None
+
+# Initialize OpenAI client
+openai_client = None
+
+# Cache for Satoshi persona description
+SATOSHI_PERSONA = None
+
+app = FastAPI(
+    title="Satoshi AI Model API",
+    description="A FastAPI endpoint to query your fine-tuned Satoshi AI model with LoRA adapter.",
+    version="1.0.0",
+)
+
+class Message(BaseModel):
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+class GenerationRequest(BaseModel):
+    messages: List[Message]
+    output_type: Literal["text", "image"] = "text"
+    temperature: float = 0.2
+    max_tokens: int = 500
+    
+    # Allow extra fields to be ignored (for backward compatibility)
+    class Config:
+        extra = "ignore"
+
+class GenerationResponse(BaseModel):
+    type: Literal["text", "image"]
+    text: str
+    url: Optional[str] = None
+    recommendations: Optional[List[str]] = None  # Add a field for recommendations
+
+@app.on_event("startup")
+def load_model_and_tokenizer():
+    """Load the base model and LoRA adapter, along with the tokenizer."""
+    global MODEL, TOKENIZER, openai_client, SATOSHI_PERSONA
+    try:
+        # Use the original Llama 3.2 1B model as our LoRA adapter is compatible with it
+        base_model_id = "meta-llama/Llama-3.2-1B-Instruct"  # Reverting to 1B model for compatibility
+        adapter_path = "satoshi-ai-model"  # This folder should contain the adapter weights and tokenizer files
+
+        # Check if HF_TOKEN is set
+        hf_token = os.environ.get("HF_TOKEN")
+        if not hf_token or hf_token == "YOUR_HUGGING_FACE_TOKEN_HERE":
+            logger.warning(
+                "HF_TOKEN not set or contains placeholder. "
+                "You need a valid Hugging Face token to download Llama models."
+            )
+            logger.warning(
+                "Please set a valid token in your .env file or as an environment variable."
+            )
+        
+        logger.info(f"Loading models and tokenizers...")
+        
+        # Load the base model without 8-bit quantization (1B model is small enough)
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_id,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            token=hf_token
+        )
+        
+        # Load the tokenizer
+        TOKENIZER = AutoTokenizer.from_pretrained(base_model_id, token=hf_token)
+        TOKENIZER.pad_token = TOKENIZER.eos_token
+        
+        # Load the adapter with PEFT
+        MODEL = PeftModel.from_pretrained(base_model, adapter_path)
+        logger.info("Model and tokenizer loaded successfully")
+
+        # Initialize OpenAI client
+        openai_api_key = os.environ.get("OPENAI_API_KEY")
+        if not openai_api_key:
+            logger.warning("OPENAI_API_KEY not set. You need a valid OpenAI API key.")
+            logger.warning(
+                "Please set a valid token in your .env file or as an environment variable."
+            )
+        else:
+            try:
+                # Clean initialization without additional parameters
+                openai_client = OpenAI(
+                    api_key=openai_api_key,
+                )
+                logger.info("OpenAI client initialized successfully")
+            except TypeError as e:
+                # Alternative initialization method for different versions
+                logger.error(f"Error with standard initialization: {e}")
+                try:
+                    from openai import api_key as openai_api_key_setter
+                    openai_api_key_setter = openai_api_key
+                    openai_client = OpenAI()
+                    logger.info("OpenAI client initialized with alternative method")
+                except Exception as alt_e:
+                    logger.error(f"Could not initialize OpenAI client: {alt_e}")
+                    openai_client = None
+
+        # Generate and cache Satoshi's persona description
+        logger.info("Generating and caching Satoshi persona description...")
+        SATOSHI_PERSONA = generate_satoshi_persona()
+        logger.debug(f"Cached persona description: {len(SATOSHI_PERSONA)} characters")
+        
+        logger.info("API startup complete")
+    except Exception as e:
+        logger.error(f"Error during model loading: {e}", exc_info=True)
+        raise e
+
+def generate_satoshi_persona():
+    """Generate a description of Satoshi Nakamoto's persona and writing style from the fine-tuned model."""
+    global MODEL, TOKENIZER
+    
+    if MODEL is None or TOKENIZER is None:
+        # Fallback if model isn't loaded
+        logger.warning("Generating default Satoshi persona - model not loaded")
+        return (
+            "Satoshi Nakamoto is the pseudonymous creator of Bitcoin. "
+            "Technical, precise, values decentralization and privacy."
+        )
+    
+    # Create a prompt asking the model to describe Satoshi's persona and writing style
+    persona_prompt = """
+    You are Satoshi Nakamoto, the creator of Bitcoin.
+    
+    Please describe your persona, character traits, writing style, and provide some examples of your typical writing.
+    Focus on how you communicate technical concepts, your tone, and what principles you prioritize.
+    Be comprehensive and include specific examples of your writing that showcase your style.
+    """
+    
+    logger.debug("Generating Satoshi persona description")
+    
+    # Format the prompt for the model
+    formatted_prompt = TOKENIZER.apply_chat_template(
+        [
+            {"role": "system", "content": "You are Satoshi Nakamoto, the pseudonymous creator of Bitcoin. Provide a detailed and authentic description of yourself."},
+            {"role": "user", "content": persona_prompt}
+        ],
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    
+    # Tokenize the prompt
+    inputs = TOKENIZER(formatted_prompt, return_tensors="pt").to(MODEL.device)
+    
+    # Remove token_type_ids if present
+    if "token_type_ids" in inputs:
+        inputs.pop("token_type_ids")
+    
+    # Generate the persona description with parameters appropriate for the 1B model
+    outputs = MODEL.generate(
+        **inputs,
+        max_new_tokens=800,  # Adjusted for 1B model capabilities
+        do_sample=True,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=50,
+        repetition_penalty=1.1,
+        no_repeat_ngram_size=3,
+        pad_token_id=TOKENIZER.eos_token_id,
+    )
+    
+    # Decode the full output
+    full_output = TOKENIZER.decode(outputs[0], skip_special_tokens=True)
+    
+    # Extract only the assistant's response
+    persona_description = full_output[len(formatted_prompt):].strip()
+    
+    # Remove any obvious artifacts or prefixes
+    for prefix in ["Assistant:", "Satoshi Nakamoto:", "A:", "Satoshi:"]:
+        if persona_description.startswith(prefix):
+            persona_description = persona_description[len(prefix):].strip()
+    
+    logger.debug(f"Generated persona description of {len(persona_description)} characters")
+    
+    return persona_description
+
+# Rename get_satoshi_persona to use the cached version
+def get_satoshi_persona():
+    """Get Satoshi Nakamoto's persona description from cache or generate if needed."""
+    global SATOSHI_PERSONA
+    
+    if SATOSHI_PERSONA is None:
+        # If persona is not cached (e.g., during development), generate it
+        logger.warning("Satoshi persona not cached, generating on-the-fly")
+        return generate_satoshi_persona()
+    else:
+        logger.debug("Using cached Satoshi persona description")
+        return SATOSHI_PERSONA
+
+@app.post("/admin/refresh_persona")
+def refresh_persona():
+    """Admin endpoint to refresh the cached Satoshi persona."""
+    global SATOSHI_PERSONA
+    
+    try:
+        SATOSHI_PERSONA = generate_satoshi_persona()
+        return {"status": "success", "message": "Satoshi persona refreshed", "length": len(SATOSHI_PERSONA)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to refresh persona: {str(e)}")
+
+@app.get("/admin/view_persona")
+def view_persona():
+    """Admin endpoint to view the cached Satoshi persona."""
+    global SATOSHI_PERSONA
+    
+    if SATOSHI_PERSONA is None:
+        raise HTTPException(status_code=404, detail="Satoshi persona not cached yet")
+    
+    return {"persona": SATOSHI_PERSONA, "length": len(SATOSHI_PERSONA)}
+
+@app.post("/generate")
+def generate_response(request: GenerationRequest):
+    """
+    POST endpoint that generates a response based on the provided messages.
+    If output_type is 'text', returns text response.
+    If output_type is 'image', renders the text onto an image and returns that image.
+    """
+    global MODEL, TOKENIZER, openai_client
+    if MODEL is None or TOKENIZER is None:
+        raise HTTPException(status_code=500, detail="Model is not loaded yet.")
+    
+    if openai_client is None:
+        raise HTTPException(status_code=500, detail="OpenAI client is not initialized. Please set OPENAI_API_KEY.")
+
+    try:
+        # Extract system message and user message from the messages array
+        system_message = next((msg.content for msg in request.messages if msg.role == "system"), 
+                             "You are Satoshi Nakamoto, the creator of Bitcoin.")
+        
+        # Get the last user message
+        user_messages = [msg for msg in request.messages if msg.role == "user"]
+        if not user_messages:
+            raise HTTPException(status_code=400, detail="At least one user message is required")
+        user_message = user_messages[-1].content
+        
+        logger.info(f"Processing request: output_type={request.output_type}, max_tokens={request.max_tokens}")
+        
+        # Branch here based on the requested output type
+        if request.output_type.lower() == "text":
+            # HANDLE TEXT GENERATION FLOW
+            
+            # Enhance the system message with more specific guidance about Satoshi's style
+            system_message += (
+                " Respond with technical precision, clarity, and the occasional brevity "
+                "that characterized Satoshi's communications. Emphasize trustlessness, "
+                "decentralization, and cryptographic principles."
+            )
+            
+            # Format the prompt following the proper Llama 3.2 chat template
+            messages = [
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_message}
+            ]
+            
+            # Use the tokenizer's built-in chat template which properly formats for Llama 3.2
+            prompt = TOKENIZER.apply_chat_template(
+                messages, 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
+            
+            # Tokenize the prompt
+            inputs = TOKENIZER(prompt, return_tensors="pt").to(MODEL.device)
+            
+            # LLaMA models typically don't use token_type_ids
+            if "token_type_ids" in inputs:
+                inputs.pop("token_type_ids")
+                
+            # Always limit fine-tuned model generation to 500 tokens
+            max_fine_tuned_tokens = 500
+            
+            logger.debug(f"Generating initial response with fine-tuned model")
+            
+            # Generate response with fine-tuned model with appropriate parameters for 1B model
+            outputs = MODEL.generate(
+                **inputs,
+                max_new_tokens=max_fine_tuned_tokens,
+                do_sample=True,
+                temperature=request.temperature,
+                top_p=0.9,
+                top_k=50,
+                repetition_penalty=1.1,
+                no_repeat_ngram_size=3,
+                pad_token_id=TOKENIZER.eos_token_id,
+            )
+            
+            # Decode the fine-tuned model output
+            full_output = TOKENIZER.decode(outputs[0], skip_special_tokens=True)
+            
+            # Extract only the assistant's response
+            fine_tuned_response = full_output[len(prompt):].strip()
+            
+            # Remove any obvious artifacts or prefixes
+            for prefix in ["Assistant:", "Satoshi Nakamoto:", "A:", "Satoshi:"]:
+                if fine_tuned_response.startswith(prefix):
+                    fine_tuned_response = fine_tuned_response[len(prefix):].strip()
+            
+            # No need to generate this every time - use the cached version
+            persona_description = get_satoshi_persona()
+            
+            # Now use GPT-4o-mini to generate the final response
+            logger.info(f"Enhancing response with GPT-4o-mini")
+            
+            if openai_client is None:
+                logger.warning("OpenAI client not available. Using fine-tuned model response directly")
+                # Default recommendations when OpenAI client is not available
+                default_recommendations = [
+                    "Read the Bitcoin whitepaper to understand the original vision",
+                    "Explore the concept of decentralized consensus mechanisms",
+                    "Learn about cryptographic signatures and how they secure ownership"
+                ]
+                return GenerationResponse(
+                    type="text",
+                    text=fine_tuned_response,
+                    recommendations=default_recommendations
+                )
+            
+            try:
+                # Ensure we respect the user's requested max_tokens precisely
+                # If max_tokens is suspiciously large (>5000), cap it reasonably
+                requested_tokens = request.max_tokens
+                if requested_tokens > 5000:
+                    logger.warning(
+                        f"Requested {requested_tokens} tokens seems excessive, capping to 1000"
+                    )
+                    requested_tokens = 1000
+                    
+                max_openai_tokens = requested_tokens
+
+                # Add a strict length instruction to the prompt
+                openai_system_prompt = f"""You are Satoshi Nakamoto, creator of Bitcoin and author of the Bitcoin whitepaper.
+
+                    Task: Respond to the user's query in Satoshi Nakamoto's authentic voice and style.
+
+                    IMPORTANT LENGTH CONSTRAINT: Your response MUST be under {max_openai_tokens} tokens (approximately {max_openai_tokens * 4} characters).
+
+                    Step 1: Analyze the draft response from a 1B parameter model. This draft contains technical details and the essence of Satoshi's thinking on this topic.
+
+                    Step 2: Rewrite the response completely in Satoshi's voice, following these guidelines:
+                    - Maintain all the technical accuracy from the draft
+                    - Be concise and precise, preferring clarity over verbosity
+                    - Use crisp declarative statements when explaining technical concepts
+                    - Focus on cryptographic principles, trustlessness, and decentralization
+                    - Keep paragraphs short and focused on a single idea
+                    - Use Satoshi's measured, professional tone
+
+                    Step 3: Structure your response with:
+                    - A direct answer to the question  
+                    - Technical explanations with logical flow
+                    - Occasional use of analogies to clarify complex ideas
+                    - A conclusion that reinforces the core principles of Bitcoin
+
+                    Persona Reference (generated by the 1B model to capture authentic Satoshi characteristics):
+                    {persona_description}
+
+                    Draft Response (preserve technical accuracy while reshaping to match Satoshi's voice):
+                    {fine_tuned_response}
+
+                    IMPORTANT: Your response should read as if written directly by Satoshi - technically precise, clear, and with the occasional brevity that characterized Satoshi's communications. Do not mention that you are responding based on a draft or that you are an AI. Most importantly, KEEP YOUR RESPONSE TO UNDER {max_openai_tokens} TOKENS.
+                """
+
+                # Enhanced system prompt for OpenAI that references the 1B model output
+                gpt_response = openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": openai_system_prompt},
+                        {"role": "user", "content": user_message}
+                    ],
+                    max_tokens=max_openai_tokens,
+                    temperature=request.temperature,
+                )
+                
+                # Extract the final response
+                response_text = gpt_response.choices[0].message.content.strip()
+                
+                # Add detailed debugging information
+                logger.debug(
+                    f"Response length: {len(response_text)} chars "
+                    f"(~{len(response_text) // 4} tokens)"
+                )
+                
+                # If response is still too long, truncate it (as a last resort)
+                if len(response_text) > (max_openai_tokens * 6):  # Very generous character-to-token ratio
+                    logger.warning(f"Response too long, truncating to ~{max_openai_tokens} tokens")
+                    response_text = response_text[:max_openai_tokens * 4]  # 4 chars per token approximation
+                    response_text += "..."
+                
+            except Exception as openai_error:
+                logger.error(f"Error calling OpenAI API: {openai_error}")
+                logger.info("Falling back to fine-tuned model response")
+                # Also limit the fallback response
+                response_text = fine_tuned_response[:request.max_tokens * 4]
+            
+            # Generate recommendations for further learning (only for text responses)
+            recommendations = []
+            try:
+                logger.info("Generating learning recommendations")
+                
+                # First get recommendations from our fine-tuned model
+                recommendation_prompt = f"""
+                Based on the query about Bitcoin: "{user_message}"
+                
+                Please suggest 3 related Bitcoin topics or concepts that would help the user deepen their understanding.
+                
+                Format your response as a simple list of 3 topics, one per line.
+                """
+                
+                # Format the prompt for the model
+                rec_messages = [
+                    {"role": "system", "content": "You are Satoshi Nakamoto, the creator of Bitcoin. Suggest related topics for further learning."},
+                    {"role": "user", "content": recommendation_prompt}
+                ]
+                
+                rec_prompt = TOKENIZER.apply_chat_template(
+                    rec_messages, 
+                    tokenize=False, 
+                    add_generation_prompt=True
+                )
+                
+                # Tokenize the prompt
+                rec_inputs = TOKENIZER(rec_prompt, return_tensors="pt").to(MODEL.device)
+                
+                # Remove token_type_ids if present
+                if "token_type_ids" in rec_inputs:
+                    rec_inputs.pop("token_type_ids")
+                    
+                # Generate recommendations with fine-tuned model
+                rec_outputs = MODEL.generate(
+                    **rec_inputs,
+                    max_new_tokens=150,  # Short output for recommendations
+                    do_sample=True,
+                    temperature=0.7,  # Slightly higher for variety
+                    top_p=0.9,
+                    top_k=50,
+                    repetition_penalty=1.1,
+                    pad_token_id=TOKENIZER.eos_token_id,
+                )
+                
+                # Decode the output
+                rec_full_output = TOKENIZER.decode(rec_outputs[0], skip_special_tokens=True)
+                
+                # Extract only the assistant's response
+                rec_text = rec_full_output[len(rec_prompt):].strip()
+                
+                # Remove any obvious artifacts or prefixes
+                for prefix in [
+                    "Assistant:", 
+                    "Satoshi Nakamoto:", 
+                    "A:", 
+                    "Satoshi:", 
+                    "Recommendations:", 
+                    "Topics:"
+                ]:
+                    if rec_text.startswith(prefix):
+                        rec_text = rec_text[len(prefix):].strip()
+                
+                logger.debug(f"Raw recommendations generated")
+                
+                # Now polish recommendations with OpenAI
+                if openai_client is not None:
+                    rec_system_prompt = f"""You are Satoshi Nakamoto, creator of Bitcoin.
+
+                        Task: Create a VERY BRIEF list of 3 specific recommendations for further learning about Bitcoin \
+                        based on the user's query and the draft recommendations.
+
+                        FORMAT: Return ONLY a JSON array of 3 strings, each under 30 words. NO introduction, \
+                        NO explanation, JUST the array.
+                        Example: ["Learn about concept X and how it relates to Y", "Explore the history of Z", \
+                        "Understand the technical aspects of W"]
+
+                        Draft recommendations:
+                        {rec_text}
+
+                        Keep the total output under 100 tokens. Make recommendations specific, insightful, and in \
+                        Satoshi's voice.
+                    """
+                    
+                    # Call OpenAI to refine the recommendations
+                    try:
+                        rec_response = openai_client.chat.completions.create(
+                            model="gpt-4o-mini",
+                            messages=[
+                                {"role": "system", "content": rec_system_prompt},
+                                {"role": "user", "content": user_message}  # Include original query for context
+                            ],
+                            max_tokens=100,
+                            temperature=0.7,
+                        )
+                        
+                        polished_recs = rec_response.choices[0].message.content.strip()
+                        
+                        # Parse the JSON array
+                        try:
+                            import re
+                            # Extract array from the response if it's not just the array
+                            array_match = re.search(r'\[(.*)\]', polished_recs, re.DOTALL)
+                            if array_match:
+                                polished_recs = '[' + array_match.group(1) + ']'
+                            
+                            recommendations = json.loads(polished_recs)
+                            
+                            # Ensure we have exactly 3 recommendations
+                            if len(recommendations) > 3:
+                                recommendations = recommendations[:3]
+                            while len(recommendations) < 3:
+                                recommendations.append(
+                                    "Explore the Bitcoin whitepaper for foundational understanding"
+                                )
+                        except json.JSONDecodeError:
+                            # If JSON parsing fails, extract recommendations line by line
+                            logger.warning("Failed to parse JSON recommendations, extracting manually")
+                            rec_lines = polished_recs.split('\n')
+                            recommendations = [
+                                line.strip().strip('"\'-•').strip() 
+                                for line in rec_lines if line.strip()
+                            ][:3]
+                            
+                            # Ensure we have exactly 3 recommendations
+                            if len(recommendations) > 3:
+                                recommendations = recommendations[:3]
+                            while len(recommendations) < 3:
+                                recommendations.append(
+                                    "Explore the Bitcoin whitepaper for foundational understanding"
+                                )
+                    except Exception as e:
+                        logger.error(f"Error refining recommendations with OpenAI: {e}")
+                        # Fall back to parsing the fine-tuned model's recommendations
+                        rec_lines = rec_text.split('\n')
+                        recommendations = [
+                            line.strip().strip('"\'-•').strip() 
+                            for line in rec_lines if line.strip()
+                        ][:3]
+                        
+                        # Ensure we have exactly 3 recommendations
+                        if len(recommendations) > 3:
+                            recommendations = recommendations[:3]
+                        while len(recommendations) < 3:
+                            recommendations.append("Explore the Bitcoin whitepaper for foundational understanding")
+                else:
+                    # Fall back to parsing the fine-tuned model's recommendations
+                    rec_lines = rec_text.split('\n')
+                    recommendations = [
+                        line.strip().strip('"\'-•').strip() 
+                        for line in rec_lines if line.strip()
+                    ][:3]
+                    
+                    # Ensure we have exactly 3 recommendations
+                    if len(recommendations) > 3:
+                        recommendations = recommendations[:3]
+                    while len(recommendations) < 3:
+                        recommendations.append("Explore the Bitcoin whitepaper for foundational understanding")
+                
+                logger.debug("Final recommendations prepared")
+                
+            except Exception as e:
+                logger.error(f"Error generating recommendations: {e}")
+                # Default recommendations if everything fails
+                recommendations = [
+                    "Read the Bitcoin whitepaper to understand the original vision",
+                    "Explore the concept of decentralized consensus mechanisms",
+                    "Learn about cryptographic signatures and how they secure ownership"
+                ]
+            
+            # Return the text response with recommendations
+            return GenerationResponse(
+                type="text",
+                text=response_text,
+                recommendations=recommendations
+            )
+            
+        elif request.output_type.lower() == "image":
+            # HANDLE IMAGE GENERATION FLOW
+            
+            # Step 1: Generate an image description using our fine-tuned Satoshi model
+            logger.info("Generating Bitcoin image description using fine-tuned model...")
+            
+            # Create a new prompt specifically asking for an image description
+            image_request_prompt = """
+            Please create a detailed description for an educational image about Bitcoin that explains the concept I'm asking about.
+            This will be used to generate a technical diagram or infographic.
+            The description should:
+            - Use clear, simple language with actual readable words (no invented text or characters)
+            - Describe a technical diagram showing the concept with labeled elements
+            - Include the Bitcoin logo or symbol as a central element
+            - Explain one specific Bitcoin concept clearly
+            
+            Image description:
+            """
+            
+            # Format the prompt following the proper Llama 3.2 chat template
+            image_messages = [
+                {"role": "system", "content": "You are Satoshi Nakamoto, the creator of Bitcoin. Create a clear, educational image description."},
+                {"role": "user", "content": user_message + "\n\n" + image_request_prompt}
+            ]
+            
+            # Use the tokenizer's built-in chat template which properly formats for Llama 3.2
+            image_prompt = TOKENIZER.apply_chat_template(
+                image_messages, 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
+            
+            # Tokenize the prompt
+            image_inputs = TOKENIZER(image_prompt, return_tensors="pt").to(MODEL.device)
+            
+            # Remove token_type_ids if present
+            if "token_type_ids" in image_inputs:
+                image_inputs.pop("token_type_ids")
+                
+            # Generate response for image description with parameters appropriate for 1B model
+            logger.info("Generating image description with fine-tuned 1B model...")
+            image_outputs = MODEL.generate(
+                **image_inputs,
+                max_new_tokens=250,  # Shorter for image descriptions
+                do_sample=True,
+                temperature=0.7,  # Slightly higher for creativity
+                top_p=0.9,
+                top_k=50,
+                repetition_penalty=1.1,
+                no_repeat_ngram_size=3,
+                pad_token_id=TOKENIZER.eos_token_id,
+            )
+            
+            # Decode the output
+            full_image_output = TOKENIZER.decode(image_outputs[0], skip_special_tokens=True)
+            
+            # Extract only the assistant's response
+            image_description = full_image_output[len(image_prompt):].strip()
+            
+            # Remove any obvious artifacts or prefixes
+            for prefix in ["Assistant:", "Satoshi Nakamoto:", "A:", "Satoshi:", "Image description:"]:
+                if image_description.startswith(prefix):
+                    image_description = image_description[len(prefix):].strip()
+            
+            # Extract the core description but keep it brief
+            core_description = image_description.strip()
+            if len(core_description) > 200:
+                core_description = core_description[:200] + "..."
+                
+            # Completely reformatted prompt for text-free diagrams with maximum quality
+            image_description = f"""
+                Create a HIGH-QUALITY, TEXT-FREE Bitcoin educational diagram illustrating: {core_description}
+
+                STYLE REQUIREMENTS:
+                - Modern, professional infographic with clean lines and visual clarity
+                - Minimalist Apple/Google-style design aesthetic
+                - High contrast with a clean white background
+                - Polished, professional finish with subtle shadows and highlights
+                - Use Bitcoin orange (#F7931A) as primary accent color
+
+                CONTENT REQUIREMENTS:
+                - NO TEXT OR WORDS WHATSOEVER - communicate entirely through visual elements
+                - Use the Bitcoin logo/symbol prominently
+                - Create a clear visual flow/process that explains the concept
+                - Use arrows, shapes, icons, and visual hierarchies to show relationships
+                - Include simple, universally understood symbols and iconography
+                - Focus on visual storytelling through diagram elements only
+
+                Quality: Use the highest detail and clarity possible - this is for professional educational purposes.
+                Subject: {core_description}
+            """
+            
+            logger.debug(f"Generated image description ({len(image_description)} chars):")
+            logger.debug(image_description[:150] + "..." if len(image_description) > 150 else image_description)
+            
+            try:
+                # Step 2: Generate the actual image using DALL-E 3 directly with our model's output
+                logger.info("Calling DALL-E 3 to generate image with fine-tuned model's description...")
+                logger.info("Final DALL-E prompt:")
+                logger.info("---BEGIN PROMPT---")
+                logger.info(image_description)
+                logger.info("---END PROMPT---")
+                
+                image_response = openai_client.images.generate(
+                    model="dall-e-3",
+                    prompt=image_description,
+                    size="1024x1024",
+                    quality="hd",  # Use HD quality for maximum detail
+                    n=1,
+                )
+                
+                # Get the image URL from DALL-E response
+                image_url = image_response.data[0].url
+                
+                # Log the revised caption provided by DALL-E (this can help debug issues)
+                if hasattr(image_response.data[0], 'revised_prompt'):
+                    logger.info("DALL-E revised the prompt to:")
+                    logger.info(image_response.data[0].revised_prompt)
+                
+                # For API consistency, also download the image
+                response = requests.get(image_url)
+                if response.status_code == 200:
+                    image_data = BytesIO(response.content)
+                    
+                    # Save to a temporary file
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp:
+                        temp.write(response.content)
+                        temp_path = temp.name
+                    
+                    # Return the image with metadata
+                    return StreamingResponse(
+                        image_data,
+                        media_type="image/png",
+                        headers={
+                            "X-Response": json.dumps(GenerationResponse(
+                                type="image",
+                                text=image_description[:500] + "..." if len(image_description) > 500 else image_description,
+                                url=image_url  # Include the original DALL-E URL
+                            ).dict())
+                        }
+                    )
+                else:
+                    raise Exception(f"Failed to download image: HTTP {response.status_code}")
+                
+            except Exception as e:
+                logger.error(f"Error generating image with DALL-E: {e}")
+                # Fallback to the old text-on-image method
+                logger.info("Falling back to text-on-image method")
+                
+                # For the fallback, we'll need a text response to render
+                # Generate a simple response with our fine-tuned model
+                fallback_outputs = MODEL.generate(
+                    **image_inputs,
+                    max_new_tokens=300,
+                    do_sample=True,
+                    temperature=0.5,
+                    top_p=0.9,
+                    pad_token_id=TOKENIZER.eos_token_id,
+                )
+                
+                fallback_text = TOKENIZER.decode(fallback_outputs[0], skip_special_tokens=True)
+                fallback_response = fallback_text[len(image_prompt):].strip()
+                
+                # Remove any prefixes from the fallback response
+                for prefix in ["Assistant:", "Satoshi Nakamoto:", "A:", "Satoshi:", "Image description:"]:
+                    if fallback_response.startswith(prefix):
+                        fallback_response = fallback_response[len(prefix):].strip()
+                
+                # Create a simple image with the text response
+                width, height = 800, 400
+                img = Image.new("RGB", (width, height), color=(255, 255, 255))
+                draw = ImageDraw.Draw(img)
+
+                # Use default font if TrueType not available
+                try:
+                    font = ImageFont.truetype("arial.ttf", 20)
+                except Exception:
+                    font = ImageFont.load_default()
+
+                # Add text to image with wrapping
+                wrapped_text = textwrap.fill(fallback_response, width=80)
+                draw.text((10, 10), wrapped_text, fill=(0, 0, 0), font=font)
+
+                # Save to temporary file
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp:
+                    img.save(temp, format="PNG")
+                    temp_path = temp.name
+
+                # Create buffer for streaming
+                buffer = BytesIO()
+                img.save(buffer, format="PNG")
+                buffer.seek(0)
+                
+                # Return with truncated text in header if needed
+                header_text = fallback_response[:500] + "..." if len(fallback_response) > 500 else fallback_response
+                
+                return StreamingResponse(
+                    buffer, 
+                    media_type="image/png",
+                    headers={
+                        "X-Response": json.dumps(GenerationResponse(
+                            type="image",
+                            text=header_text,
+                            url=f"/temp/{os.path.basename(temp_path)}"
+                        ).dict())
+                    }
+                )
+        else:
+            raise HTTPException(status_code=400, detail="Invalid output type. Must be 'text' or 'image'.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/get_full_response/{response_id}")
+def get_full_response(response_id: str):
+    """
+    Endpoint to retrieve a full response by ID.
+    This can be used when responses are too large for headers.
+    """
+    # Implement storage and retrieval logic here
+    # For now, just a placeholder
+    return {"message": "Full response retrieval not yet implemented"}
+
+if __name__ == "__main__":
+    import uvicorn
+    # Run the app on port 8000, accessible on localhost
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+

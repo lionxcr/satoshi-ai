@@ -30,9 +30,18 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.ERROR,  # Only show ERROR level logs and above
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()]
 )
+# Set logging level for all third-party libraries to ERROR
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("peft").setLevel(logging.ERROR)
+logging.getLogger("torch").setLevel(logging.ERROR)
+logging.getLogger("datasets").setLevel(logging.ERROR)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
+logging.getLogger("httpx").setLevel(logging.ERROR)
+
 logger = logging.getLogger(__name__)
 
 # Constants
@@ -106,7 +115,10 @@ def prepare_training_data(dataset: Dataset, tokenizer) -> Dataset:
     """Prepare and tokenize the dataset for training."""
     # Add a special instruction and Satoshi persona to each example
     def add_satoshi_persona(examples):
-        satoshi_prefix = "You are Satoshi Nakamoto, the creator of Bitcoin. Please respond with deep technical knowledge and the writing style of Satoshi Nakamoto: "
+        satoshi_prefix = (
+            "You are Satoshi Nakamoto, the creator of Bitcoin. "
+            "Please respond with deep technical knowledge and the writing style of Satoshi Nakamoto: "
+        )
         
         # Format examples with the Satoshi persona instruction
         texts = []
@@ -120,10 +132,17 @@ def prepare_training_data(dataset: Dataset, tokenizer) -> Dataset:
                     answer = text
                     formatted_text = f"### Instruction:\n{question}\n\n### Response:\n{answer}"
                 else:
-                    formatted_text = f"### Instruction:\nExplain the following Bitcoin concept: {text[:50]}...\n\n### Response:\n{text}"
+                    formatted_text = (
+                        f"### Instruction:\n"
+                        f"Explain the following Bitcoin concept: {text[:50]}...\n\n"
+                        f"### Response:\n{text}"
+                    )
             else:
                 # Direct Satoshi-style response
-                formatted_text = f"### Instruction:\n{satoshi_prefix}\n\n### Response:\n{text}"
+                formatted_text = (
+                    f"### Instruction:\n{satoshi_prefix}\n\n"
+                    f"### Response:\n{text}"
+                )
             
             texts.append(formatted_text)
         
@@ -179,8 +198,12 @@ def main():
     
     # Check for CUDA availability and memory
     if torch.cuda.is_available():
-        logger.info(f"CUDA is available. Using device: {torch.cuda.get_device_name(0)}")
-        logger.info(f"Total GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        logger.info(
+            f"CUDA is available. Using device: {torch.cuda.get_device_name(0)}"
+        )
+        logger.info(
+            f"Total GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB"
+        )
     else:
         logger.warning("CUDA is not available. Training will be very slow on CPU!")
     
@@ -277,7 +300,9 @@ def main():
     batch_size = 16  # Increased from 8 to 16 for faster training
     grad_accumulation = 2  # Reduced from 4 to 2 for faster updates
     
-    logger.info(f"Using batch size of {batch_size} with gradient accumulation steps of {grad_accumulation}")
+    logger.info(
+        f"Using batch size of {batch_size} with gradient accumulation steps of {grad_accumulation}"
+    )
     
     # Reduce number of epochs in fast mode (only for fresh training)
     num_epochs = training_config["num_train_epochs"]
