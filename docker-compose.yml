@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  satoshi-ai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models:/app/models  # Mount models directory if you have pre-downloaded models
+      - ./temp:/app/temp      # Mount temp directory for image storage
+    env_file:
+      - .env                  # Load environment variables from .env file
+    environment:
+      - HF_TOKEN              # Pass Hugging Face token from host environment if set
+      - OPENAI_API_KEY        # Pass OpenAI API key from host environment if set
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/docs"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s      # Allow time for model loading
+
+  # GPU-enabled service (uncomment and use this instead of satoshi-ai for GPU support)
+  satoshi-ai-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models:/app/models  # Mount models directory for caching
+      - ./temp:/app/temp      # Mount temp directory for image storage
+    env_file:
+      - .env
+    environment:
+      - HF_TOKEN
+      - OPENAI_API_KEY
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/docs"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s     # Allow more time for GPU model loading
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # By default, this service is commented out in the original file.
+    # To use GPU, comment out the satoshi-ai service above and uncomment this section.
+    profiles:
+      - gpu 

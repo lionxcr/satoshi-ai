@@ -5,6 +5,12 @@
 !*/
 !.gitignore
 
+# Docker and configuration files
+!docker-compose.yml
+!Dockerfile.gpu
+!.env.example
+!run.sh
+
 # Allow satoshi-ai-model files
 !satoshi-ai-model/**/*
 
