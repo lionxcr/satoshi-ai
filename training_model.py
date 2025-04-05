@@ -41,7 +41,7 @@ OUTPUT_DIR = "./satoshi-ai-model"
 TRAINING_DATA_DIR = "./training-data/output"
 PEFT_CONFIG_PATH = os.path.join(TRAINING_DATA_DIR, "persona_peft_config.json")
 SEED = 42
-MAX_SEQ_LENGTH = 2048  # Restored to full sequence length for 40GB RAM
+MAX_SEQ_LENGTH = 1024  # Keep at 1024 for faster training
 
 # Set random seeds for reproducibility
 random.seed(SEED)
@@ -132,12 +132,12 @@ def prepare_training_data(dataset: Dataset, tokenizer) -> Dataset:
     # Apply the persona transformation
     persona_dataset = dataset.map(add_satoshi_persona, batched=True)
     
-    # Tokenize the dataset with restored full sequence length
+    # Tokenize the dataset
     def tokenize_function(examples):
         return tokenizer(
             examples["text"],
             truncation=True,
-            max_length=MAX_SEQ_LENGTH,  # Using full sequence length with 40GB RAM
+            max_length=MAX_SEQ_LENGTH,
             padding="max_length",
         )
     
@@ -145,7 +145,7 @@ def prepare_training_data(dataset: Dataset, tokenizer) -> Dataset:
         tokenize_function,
         batched=True,
         remove_columns=["source"],
-        num_proc=4,  # Increased from 1 to 4 for faster processing
+        num_proc=2,  # Reduced from 4 to 2 to avoid CPU bottlenecks
     )
     
     logger.info(f"Prepared and tokenized {len(tokenized_dataset)} examples for training")
@@ -159,6 +159,11 @@ def parse_args():
         type=str,
         default=None,
         help="Path to a checkpoint to resume training from",
+    )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Enable fast training mode with optimized settings",
     )
     return parser.parse_args()
 
@@ -194,8 +199,7 @@ def main():
         quantization_config=bnb_config,
         device_map="auto",
         trust_remote_code=True,
-        torch_dtype=torch.float16,  # Use float16 to reduce memory usage
-        offload_folder="offload_folder",  # Enable CPU offloading for memory management
+        torch_dtype=torch.float16,
     )
     
     # Load tokenizer
@@ -209,8 +213,14 @@ def main():
     
     # Get LoRA configuration from loaded PEFT config
     logger.info("Setting up LoRA configuration")
+    # Reduce r value for faster training
+    lora_r = peft_config["lora_config"]["r"]
+    if args.fast and lora_r > 8:
+        lora_r = 8
+        logger.info(f"Fast mode enabled: Reduced LoRA r to {lora_r}")
+    
     lora_config = LoraConfig(
-        r=peft_config["lora_config"]["r"],
+        r=lora_r,
         lora_alpha=peft_config["lora_config"]["lora_alpha"],
         lora_dropout=peft_config["lora_config"]["lora_dropout"],
         bias=peft_config["lora_config"]["bias"],
@@ -239,36 +249,43 @@ def main():
     # Set up training arguments from PEFT config
     training_config = peft_config["training_args"]
     
-    # Optimize batch size and gradient accumulation for 40GB RAM
-    batch_size = 8  # Increased from 2 to 8 for 40GB RAM
-    grad_accumulation = 4  # Reduced from 8 to 4 for faster updates
+    # Optimize batch size and gradient accumulation for maximum speed with 40GB RAM
+    batch_size = 16  # Increased from 8 to 16 for faster training
+    grad_accumulation = 2  # Reduced from 4 to 2 for faster updates
     
     logger.info(f"Using batch size of {batch_size} with gradient accumulation steps of {grad_accumulation}")
+    
+    # Reduce number of epochs in fast mode
+    num_epochs = training_config["num_train_epochs"]
+    if args.fast and num_epochs > 3:
+        num_epochs = 3
+        logger.info(f"Fast mode enabled: Reduced epochs to {num_epochs}")
     
     logger.info("Setting up training arguments")
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
         learning_rate=training_config["learning_rate"],
-        num_train_epochs=training_config["num_train_epochs"],
-        per_device_train_batch_size=batch_size,  # Increased batch size
-        per_device_eval_batch_size=batch_size,   # Increased eval batch size
-        gradient_accumulation_steps=grad_accumulation,  # Reduced gradient accumulation
-        gradient_checkpointing=True,  # Keep gradient checkpointing for memory efficiency
+        num_train_epochs=num_epochs,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        gradient_accumulation_steps=grad_accumulation,
+        gradient_checkpointing=False,  # Disable gradient checkpointing for speed
         warmup_ratio=training_config["warmup_ratio"],
         weight_decay=training_config["weight_decay"],
         fp16=training_config["fp16"],
         max_grad_norm=training_config["max_grad_norm"],
         logging_steps=10,
         save_strategy="epoch",
-        eval_strategy="epoch",  # Updated from evaluation_strategy
-        load_best_model_at_end=True,
-        save_total_limit=3,  # Slightly increased to keep more checkpoints
+        eval_strategy="no",  # Disable evaluation for speed
+        save_total_limit=1,  # Keep only the latest checkpoint
         report_to="tensorboard",
-        # Optimized settings for 40GB RAM
-        optim="adamw_torch_fused",  # Use fused optimizer
+        # Optimized settings for speed
+        optim="adamw_torch_fused",
         ddp_find_unused_parameters=False,
-        dataloader_num_workers=2,  # Increased from 0 to 2
+        dataloader_num_workers=4,  # Increased to 4 for faster data loading
         remove_unused_columns=True,
+        # Memory optimization
+        bf16=True,  # Enable bfloat16 for faster computation
     )
     
     # Create data collator
@@ -283,7 +300,7 @@ def main():
         model=model,
         args=training_args,
         train_dataset=split_dataset["train"],
-        eval_dataset=split_dataset["test"],
+        eval_dataset=split_dataset["test"] if training_args.eval_strategy != "no" else None,
         data_collator=data_collator,
     )
     
