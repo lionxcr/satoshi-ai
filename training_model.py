@@ -165,6 +165,11 @@ def parse_args():
         action="store_true",
         help="Enable fast training mode with optimized settings",
     )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Start fresh training, ignoring existing checkpoints",
+    )
     return parser.parse_args()
 
 def main():
@@ -179,6 +184,21 @@ def main():
     else:
         logger.warning("CUDA is not available. Training will be very slow on CPU!")
     
+    # Check for existing checkpoints
+    checkpoint_path = args.resume_from_checkpoint
+    has_checkpoint = False
+    
+    if checkpoint_path:
+        has_checkpoint = True
+        logger.info(f"Will resume from specified checkpoint: {checkpoint_path}")
+    elif not args.fresh:
+        # Check if there's a checkpoint in the output directory
+        checkpoints = glob.glob(os.path.join(OUTPUT_DIR, "checkpoint-*"))
+        if checkpoints:
+            latest_checkpoint = max(checkpoints, key=os.path.getctime)
+            logger.info(f"Found existing checkpoint: {latest_checkpoint}")
+            has_checkpoint = True
+            
     # Load PEFT config
     logger.info("Loading PEFT configuration")
     peft_config = load_peft_config()
@@ -213,11 +233,15 @@ def main():
     
     # Get LoRA configuration from loaded PEFT config
     logger.info("Setting up LoRA configuration")
-    # Reduce r value for faster training
+    # Only reduce r value for new training, not when resuming from checkpoint
     lora_r = peft_config["lora_config"]["r"]
-    if args.fast and lora_r > 8:
+    
+    # Only reduce the rank for fresh training, not when resuming from checkpoint
+    if args.fast and not has_checkpoint and lora_r > 8:
         lora_r = 8
         logger.info(f"Fast mode enabled: Reduced LoRA r to {lora_r}")
+    else:
+        logger.info(f"Using original LoRA r: {lora_r}")
     
     lora_config = LoraConfig(
         r=lora_r,
@@ -255,12 +279,23 @@ def main():
     
     logger.info(f"Using batch size of {batch_size} with gradient accumulation steps of {grad_accumulation}")
     
-    # Reduce number of epochs in fast mode
+    # Reduce number of epochs in fast mode (only for fresh training)
     num_epochs = training_config["num_train_epochs"]
-    if args.fast and num_epochs > 3:
+    if args.fast and not has_checkpoint and num_epochs > 3:
         num_epochs = 3
         logger.info(f"Fast mode enabled: Reduced epochs to {num_epochs}")
     
+    # For checkpoint compatibility, use the same precision as the original training
+    # If resuming from a checkpoint, use fp16 as that's what was used originally
+    # For new training, we can use bf16 for faster computation
+    use_fp16 = has_checkpoint or not args.fast
+    use_bf16 = not use_fp16
+    
+    if has_checkpoint:
+        logger.info("Using fp16 for checkpoint compatibility")
+    elif args.fast:
+        logger.info("Using bf16 for faster computation in fast mode")
+        
     logger.info("Setting up training arguments")
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
@@ -272,7 +307,7 @@ def main():
         gradient_checkpointing=False,  # Disable gradient checkpointing for speed
         warmup_ratio=training_config["warmup_ratio"],
         weight_decay=training_config["weight_decay"],
-        fp16=False,  # Disabled to use bf16 instead
+        fp16=use_fp16,  # Use fp16 if resuming from checkpoint
         max_grad_norm=training_config["max_grad_norm"],
         logging_steps=10,
         save_strategy="epoch",
@@ -285,7 +320,7 @@ def main():
         dataloader_num_workers=4,  # Increased to 4 for faster data loading
         remove_unused_columns=True,
         # Memory optimization
-        bf16=True,  # Enable bfloat16 for faster computation
+        bf16=use_bf16,  # Use bf16 only for fresh training in fast mode
     )
     
     # Create data collator
@@ -310,12 +345,10 @@ def main():
     # Train model with checkpoint resumption support
     logger.info("Starting training")
     try:
-        checkpoint_path = args.resume_from_checkpoint
-        
         if checkpoint_path:
             logger.info(f"Resuming training from checkpoint: {checkpoint_path}")
             trainer.train(resume_from_checkpoint=checkpoint_path)
-        else:
+        elif not args.fresh:
             # Check if there's a checkpoint in the output directory
             checkpoints = glob.glob(os.path.join(OUTPUT_DIR, "checkpoint-*"))
             if checkpoints:
@@ -330,6 +363,9 @@ def main():
             else:
                 logger.info("No checkpoints found. Starting fresh training.")
                 trainer.train()
+        else:
+            logger.info("Starting fresh training as requested.")
+            trainer.train()
     except Exception as e:
         logger.error(f"Error during training: {e}")
         # Try to save partial progress if possible

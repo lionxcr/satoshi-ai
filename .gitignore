@@ -5,6 +5,9 @@
 !*/
 !.gitignore
 
+# Allow satoshi-ai-model files
+!satoshi-ai-model/**/*
+
 # Allow only the fine-tuned model output files
 # Adjust these patterns based on how your specific model files are named
 !model-output/**/*.gguf
