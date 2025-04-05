@@ -272,7 +272,7 @@ def main():
         gradient_checkpointing=False,  # Disable gradient checkpointing for speed
         warmup_ratio=training_config["warmup_ratio"],
         weight_decay=training_config["weight_decay"],
-        fp16=training_config["fp16"],
+        fp16=False,  # Disabled to use bf16 instead
         max_grad_norm=training_config["max_grad_norm"],
         logging_steps=10,
         save_strategy="epoch",
