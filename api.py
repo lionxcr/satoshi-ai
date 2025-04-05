@@ -21,6 +21,7 @@ import textwrap
 import tempfile
 import requests
 from openai import OpenAI
+import re
 
 # Load environment variables
 load_dotenv()
@@ -66,8 +67,8 @@ class Message(BaseModel):
 class GenerationRequest(BaseModel):
     messages: List[Message]
     output_type: Literal["text", "image"] = "text"
-    temperature: float = 0.2
-    max_tokens: int = 1000
+    temperature: float = 0.5
+    max_tokens: int = 800
     
     # Allow extra fields to be ignored (for backward compatibility)
     class Config:
@@ -122,6 +123,338 @@ def calculate_token_cost(
     
     # Round to the nearest whole number
     return round(total_token_cost)
+
+def evaluate_response_quality(response_text: str, user_query: str, model_client: OpenAI) -> Dict[str, Any]:
+    """
+    Evaluate the quality of a generated response, checking for completeness, clarity,
+    and alignment with the user's query.
+    
+    Args:
+        response_text: The generated response to evaluate
+        user_query: The original user query
+        model_client: OpenAI client instance
+    
+    Returns:
+        Dict containing:
+        - quality_score: float between 0-100
+        - is_complete: bool indicating if response is complete
+        - feedback: str with improvement suggestions
+        - is_acceptable: bool indicating if quality meets threshold (88%)
+    """
+    logger.info("Evaluating response quality...")
+    
+    # First, perform a pre-check for truncated beginning
+    # The key patterns that indicate response truncation at the beginning
+    truncated_beginning_patterns = [
+        r"^[a-z]",  # Starts with lowercase letter
+        r"^\s*[,;:]",  # Starts with punctuation
+        r"^(the|this|that|these|those|it|they|them|their|there|here|and|or|but|so|because|since|although|yet|therefore|thus|however|nevertheless)",  # Starts with conjunction or pronoun
+        r"^[^\w#\*\-\>\`]",  # Doesn't start with word char, markdown, or code block
+    ]
+    
+    # Check if the response might be truncated at the beginning
+    might_be_truncated = False
+    if response_text:
+        first_words = response_text.strip().split()[:3] if response_text.strip() else []
+        first_line = response_text.strip().split('\n')[0] if response_text.strip() else ""
+        
+        # Early truncation detection
+        for pattern in truncated_beginning_patterns:
+            if re.match(pattern, response_text.strip(), re.IGNORECASE):
+                might_be_truncated = True
+                break
+                
+        # Check if the first sentence is very short and doesn't make sense alone
+        if first_line and len(first_line) < 30 and first_line[-1] not in ['.', '!', '?']:
+            # Short first line without ending punctuation is suspicious
+            might_be_truncated = True
+    
+    # If response is very short, it's likely incomplete
+    if len(response_text) < 100:
+        return {
+            "quality_score": 50.0,
+            "is_complete": False,
+            "feedback": "Response is too short to be complete. Expand on the answer.",
+            "is_acceptable": False
+        }
+    
+    # Check for basic structural completeness
+    has_intro = any(s in response_text[:200].lower() for s in ["bitcoin", "blockchain", "cryptocurrency", "system", "network", "protocol"])
+    has_conclusion = any(s in response_text[-200:].lower() for s in ["summary", "conclusion", "finally", "in essence", "ultimately", "in conclusion", "to summarize", "in closing"])
+    ends_properly = response_text[-1] in ['.', '!', '?', '"', "'", ')', ']', '}']
+    
+    # Quick-fail for obviously truncated responses
+    if might_be_truncated:
+        return {
+            "quality_score": 50.0,
+            "is_complete": False,
+            "feedback": "Response appears to be truncated at the beginning. Please ensure it starts with a proper introduction and begins with one of these phrases: 'In Bitcoin...', 'To answer your question about...', 'The key to understanding...', or 'Let me explain...'.",
+            "is_acceptable": False
+        }
+    
+    # Enhanced check for proper beginning (not starting mid-sentence)
+    starts_properly = False
+    if len(response_text) > 10:
+        # Response should start with a capital letter, or a markdown heading or list
+        first_char = response_text[0]
+        starts_properly = (first_char.isupper() or first_char in ['#', '-', '*', '1', '>', '`'])
+        # Also check for markdown formatting indicators at start
+        if not starts_properly:
+            starts_properly = any(response_text.startswith(md) for md in ['# ', '## ', '### ', '- ', '* ', '1. ', '> '])
+        
+        # If still not marked as starting properly, perform deeper checks
+        if not starts_properly:
+            # Check first few words - might be lower case but should form a coherent phrase
+            first_words = ' '.join(response_text.split()[:3]).lower()
+            
+            # Check if it starts with common pronouns or conjunctions that shouldn't start a response
+            starts_with_bad_pronoun = any(first_words.startswith(p) for p in [
+                'it ', 'they ', 'their ', 'these ', 'those ', 'this ', 'that ', 
+                'and ', 'or ', 'but ', 'so ', 'because ', 'since ', 'although ',
+                'which ', 'where ', 'when ', 'how ', 'why ', 'what ', 'who ',
+                'additionally', 'furthermore', 'moreover', 'therefore', 'thus',
+                'however', 'nevertheless', 'also', 'yet', 'then', 'now'
+            ])
+            
+            # Response is cut off at beginning if it starts with a pronoun/conjunction without context
+            if starts_with_bad_pronoun:
+                starts_properly = False
+            else:
+                # If it doesn't start with pronoun, it might be okay even if lowercase
+                starts_properly = True
+                
+            # Check if first sentence is grammatically complete
+            first_sentence_end = response_text.find('.')
+            if first_sentence_end > 0:
+                first_sentence = response_text[:first_sentence_end].strip()
+                # If first sentence is too short, it might be truncated
+                if 0 < len(first_sentence) < 20:
+                    # Very short first sentence is suspicious
+                    starts_properly = False
+    
+    # Check for preferred beginning phrases
+    has_preferred_beginning = False
+    preferred_beginnings = [
+        "in bitcoin", 
+        "to answer your question about", 
+        "the key to understanding", 
+        "let me explain"
+    ]
+    
+    for phrase in preferred_beginnings:
+        if response_text.lower().startswith(phrase):
+            has_preferred_beginning = True
+            break
+    
+    # Boost scores for responses that follow our preferred beginning format
+    beginning_bonus = 10.0 if has_preferred_beginning else 0.0
+    
+    # Check if response starts directly with a code block without introduction
+    starts_with_code = False
+    if len(response_text) > 10:
+        starts_with_code = response_text.startswith('```')
+    
+    # Create evaluation prompt - simplified for gpt-4o-mini to ensure it completes properly
+    evaluation_prompt = f"""Evaluate this Bitcoin response quality (1-100 scale):
+
+Query: "{user_query}"
+
+Response:
+'''
+{response_text}
+'''
+
+Score these criteria (1-100):
+1. COMPLETENESS: Fully addresses query without cutting off?
+2. CLARITY: Easy to understand for semi-technical people?
+3. ACCURACY: Technically accurate for Bitcoin?
+4. STRUCTURE: Has proper beginning and conclusion?
+5. FORMATTING: Good markdown usage?
+6. PROPER BEGINNING: Starts with complete intro (not cut off)?
+
+For each, provide:
+- Score (1-100)
+- Short justification
+- Brief suggestion if below 90
+
+Return ONLY a JSON object with these exact keys:
+{{
+  "completeness": {{ "score": 0-100, "justification": "string", "suggestion": "string" }},
+  "clarity": {{ "score": 0-100, "justification": "string", "suggestion": "string" }},
+  "accuracy": {{ "score": 0-100, "justification": "string", "suggestion": "string" }},
+  "structure": {{ "score": 0-100, "justification": "string", "suggestion": "string" }},
+  "formatting": {{ "score": 0-100, "justification": "string", "suggestion": "string" }},
+  "proper_beginning": {{ "score": 0-100, "justification": "string", "suggestion": "string" }},
+  "overall_score": 0-100,
+  "is_acceptable": true/false,
+  "improvement_suggestions": ["string", "string", "string"]
+}}
+"""
+    
+    try:
+        # Call OpenAI to evaluate the response - switched to gpt-4o-mini for faster, more reliable evaluation
+        logger.info("Using gpt-4o-mini for response quality evaluation")
+        evaluation_response = model_client.chat.completions.create(
+            model="gpt-4o-mini",  # Changed from gpt-4o to gpt-4o-mini
+            messages=[
+                {"role": "system", "content": "You are a quality evaluation assistant for Bitcoin technical content. Your job is to assess response quality. Focus especially on whether the response has a proper beginning or appears cut off."},
+                {"role": "user", "content": evaluation_prompt}
+            ],
+            max_tokens=800,  # Reduced from 1000 to be more efficient with mini model
+            temperature=0.1,  # Low temperature for consistent evaluations
+        )
+        
+        # Extract the evaluation
+        evaluation_text = evaluation_response.choices[0].message.content.strip()
+        
+        # Parse JSON from the response
+        import json
+        import re
+        
+        # Try to extract JSON if it's embedded in text
+        json_match = re.search(r'\{.*\}', evaluation_text, re.DOTALL)
+        if json_match:
+            evaluation_text = json_match.group(0)
+            
+        try:
+            evaluation = json.loads(evaluation_text)
+            
+            # Extract key metrics
+            overall_score = evaluation.get("overall_score", 0)
+            is_acceptable = evaluation.get("is_acceptable", False)
+            
+            # Check specifically for proper beginning issues - even more aggressive penalty
+            beginning_score = evaluation.get("proper_beginning", {}).get("score", 0)
+            if beginning_score < 85:  # Increased threshold from 80 to 85
+                logger.warning(f"Response has poor beginning (score: {beginning_score}/100)")
+                # Apply more aggressive penalty
+                if overall_score > 70:
+                    overall_score = max(60, overall_score - 30)  # Increased penalty from 25 to 30
+                    is_acceptable = overall_score >= 88.0
+            
+            # Apply bonus for preferred beginnings
+            if has_preferred_beginning:
+                overall_score = min(100, overall_score + beginning_bonus)
+                is_acceptable = overall_score >= 88.0
+            
+            # Combine improvement suggestions
+            suggestions = evaluation.get("improvement_suggestions", [])
+            criteria_suggestions = []
+            for criterion in ["completeness", "clarity", "accuracy", "structure", "formatting", "proper_beginning"]:
+                if criterion in evaluation and "suggestion" in evaluation[criterion]:
+                    suggestion = evaluation[criterion]["suggestion"]
+                    if suggestion and len(suggestion) > 5:  # Only add non-empty suggestions
+                        criteria_suggestions.append(suggestion)
+            
+            # Prioritize beginning issues in suggestions
+            if "proper_beginning" in evaluation and "suggestion" in evaluation["proper_beginning"]:
+                beginning_suggestion = evaluation["proper_beginning"]["suggestion"]
+                if beginning_suggestion and len(beginning_suggestion) > 5:
+                    # Add to beginning of suggestions list
+                    criteria_suggestions.insert(0, beginning_suggestion)
+                    # If beginning issues, add our specific requirements
+                    if beginning_score < 90:
+                        criteria_suggestions.insert(0, "Start with one of these phrases: 'In Bitcoin...', 'To answer your question about...', 'The key to understanding...', or 'Let me explain...'")
+            
+            # Combine all suggestions, remove duplicates, and limit to top 3
+            all_suggestions = suggestions + criteria_suggestions
+            unique_suggestions = list(dict.fromkeys(all_suggestions))  # Remove duplicates while preserving order
+            top_suggestions = unique_suggestions[:3]
+            
+            # Generate feedback prompt for regeneration
+            feedback = "Improve the response by:\n" + "\n".join([f"- {s}" for s in top_suggestions])
+
+            # More strict is_complete criteria - require 90+ for beginning score
+            return {
+                "quality_score": overall_score,
+                "is_complete": evaluation.get("completeness", {}).get("score", 0) >= 85 and beginning_score >= 90,
+                "feedback": feedback,
+                "is_acceptable": is_acceptable,
+                "raw_evaluation": evaluation  # Include raw evaluation for debugging
+            }
+            
+        except json.JSONDecodeError:
+            # Fallback simple evaluation if JSON parsing fails
+            logger.warning("Failed to parse JSON evaluation, using fallback evaluation")
+            simple_quality = 70.0  # Default moderate score
+            feedback = ""
+            
+            # Basic completeness checks
+            if ends_properly and (has_conclusion or len(response_text) > 1000):
+                simple_quality += 15.0
+            else:
+                simple_quality -= 15.0
+                feedback += " Ensure the response ends properly with a conclusion."
+                
+            # Enhanced check for proper beginning
+            if not starts_properly:
+                simple_quality -= 30.0  # Even more severe penalty for bad beginning (increased from 25)
+                feedback += " Response MUST begin properly with a complete introduction, not mid-sentence."
+                feedback += " Start with one of these phrases: 'In Bitcoin...', 'To answer your question about...', 'The key to understanding...', or 'Let me explain...'"
+            
+            # Apply bonus for preferred beginnings
+            if has_preferred_beginning:
+                simple_quality = min(100, simple_quality + beginning_bonus)
+                
+            # Check for starting with code block
+            if starts_with_code:
+                simple_quality -= 15.0
+                feedback += " Response should not start directly with a code block. Add a proper introduction first."
+                
+            # Basic formatting checks    
+            if "```" in response_text:  # Has code blocks
+                simple_quality += 5.0
+                
+            if "#" in response_text or "**" in response_text:  # Has headings or emphasis
+                simple_quality += 5.0
+            
+            is_acceptable = simple_quality >= 88.0
+            
+            if not feedback:
+                feedback = "Ensure the response has a proper introduction, conclusion, and good formatting. Address all aspects of the query."
+            
+            return {
+                "quality_score": simple_quality,
+                "is_complete": ends_properly and has_conclusion and starts_properly,
+                "feedback": feedback,
+                "is_acceptable": is_acceptable
+            }
+    
+    except Exception as e:
+        logger.error(f"Error in response quality evaluation: {e}")
+        # Fallback evaluation based on basic checks
+        basic_score = 70.0  # Default score (reduced from 75 to be more conservative)
+        
+        # Adjust score based on basic checks
+        if not ends_properly:
+            basic_score -= 15.0  # Penalize for not ending properly
+            
+        if not starts_properly:
+            basic_score -= 30.0  # Even more severe penalty for bad beginning (increased from 25)
+            
+        if not has_intro:
+            basic_score -= 15.0  # Increased penalty for no clear introduction (from 10)
+            
+        if not has_conclusion:
+            basic_score -= 10.0  # Penalize for no conclusion
+        
+        # Apply bonus for preferred beginnings
+        if has_preferred_beginning:
+            basic_score = min(100, basic_score + beginning_bonus)
+            
+        # Check for starting with code block
+        if starts_with_code:
+            basic_score -= 20.0  # Increased penalty for starting with code (from 15)
+        
+        is_acceptable = basic_score >= 88.0
+        feedback = "The response MUST have a proper beginning and not start mid-sentence. Start with one of these phrases: 'In Bitcoin...', 'To answer your question about...', 'The key to understanding...', or 'Let me explain...'"
+        
+        return {
+            "quality_score": basic_score,
+            "is_complete": ends_properly and has_conclusion and starts_properly,
+            "feedback": feedback,
+            "is_acceptable": is_acceptable
+        }
 
 @app.on_event("startup")
 def load_model_and_tokenizer():
@@ -235,6 +568,8 @@ def generate_satoshi_persona():
         showcasing your principles and approach. Address the Bitcoin community, 
         reflecting your trust in cryptographic solutions over centralized systems, 
         and your commitment to open-source empowerment.
+        When discussing technical implementations, provide clear, well-formatted code examples
+        to illustrate your points, similar to how you would have done in the early Bitcoin codebase.
         
         MAKE SURE YOU ARE RESPONDING IN THE STYLE OF SATOSHI NAKAMOTO.
         MAKE SURE YOU PROVIDE THREE EXAMPLES OF YOUR WRITING STYLE.
@@ -356,6 +691,8 @@ def generate_response(request: GenerationRequest):
                 " Respond with technical precision, clarity, and the occasional brevity "
                 "that characterized Satoshi's communications. Emphasize trustlessness, "
                 "decentralization, and cryptographic principles."
+                " For technical questions, include clear, well-formatted code examples when appropriate. "
+                "Format code blocks using triple backticks with language specification."
             )
             
             # Format the prompt following the proper Llama 3.2 chat template
@@ -403,27 +740,30 @@ def generate_response(request: GenerationRequest):
             # Decode the fine-tuned model output
             full_output = TOKENIZER.decode(outputs[0], skip_special_tokens=True)
             
-            # Extract only the assistant's response
-            fine_tuned_response = full_output[len(prompt):].strip()
+            # Extract only the assistant's response - DO NOT STRIP anything from the beginning
+            fine_tuned_response = full_output[len(prompt):]
             
-            # Remove any obvious artifacts or prefixes
+            # Remove any obvious artifacts or prefixes, but be careful to not strip valid content
             for prefix in ["Assistant:", "Satoshi Nakamoto:", "A:", "Satoshi:"]:
                 if fine_tuned_response.startswith(prefix):
-                    fine_tuned_response = fine_tuned_response[len(prefix):].strip()
+                    fine_tuned_response = fine_tuned_response[len(prefix):]
+                    # Only strip whitespace at the beginning if it's just a single space
+                    if fine_tuned_response.startswith(" "):
+                        fine_tuned_response = fine_tuned_response[1:]
             
             # No need to generate this every time - use the cached version
             persona_description = get_satoshi_persona()
             
-            # Now use GPT-4o-mini to generate the final response
-            logger.info(f"Enhancing response with GPT-4o-mini")
+            # Now use GPT-4o to generate the final response
+            logger.info(f"Enhancing response with GPT-4o")
             
             if openai_client is None:
                 logger.warning("OpenAI client not available. Using fine-tuned model response directly")
                 # Default recommendations when OpenAI client is not available
                 default_recommendations = [
                     "Read the Bitcoin whitepaper to understand the original vision",
-                    "Explore the concept of decentralized consensus mechanisms",
-                    "Learn about cryptographic signatures and how they secure ownership"
+                    "Explore Bitcoin's source code on GitHub to see cryptographic principles in action",
+                    "Implement a simple blockchain in your preferred programming language to grasp the core concepts"
                 ]
                 # Calculate token cost without OpenAI
                 token_cost = calculate_token_cost(
@@ -447,50 +787,92 @@ def generate_response(request: GenerationRequest):
                         f"Requested {requested_tokens} tokens seems excessive, capping to 1000"
                     )
                     requested_tokens = 1000
+                elif requested_tokens < 500:
+                    logger.warning(
+                        f"Requested {requested_tokens} tokens seems too small for complete responses, increasing to 500"
+                    )
+                    requested_tokens = 500
                     
-                max_openai_tokens = requested_tokens
+                # Add a small buffer to ensure complete thoughts (will still be capped by the model)
+                max_openai_tokens = requested_tokens + 100  # Add buffer for completion
+                
+                # Add completion buffer to the logger message
+                logger.info(f"Using token limit of {max_openai_tokens} (includes completion buffer)")
 
-                # Add a strict length instruction to the prompt
-                openai_system_prompt = f"""You are Satoshi Nakamoto, creator of Bitcoin and author of the Bitcoin whitepaper.
+                # Add a strict length instruction to the prompt with rich text formatting instructions for better frontend rendering
+                openai_system_prompt = f"""You are Satoshi Nakamoto, creator of Bitcoin.
 
-                    Task: Respond to the user's query in Satoshi Nakamoto's authentic voice and style.
+                    TASK: Create a CLEAR, CONCISE response to the user's query, based on the draft text below.
+                    
+                    MAXIMUM LENGTH: Your response MUST be under {max_openai_tokens} tokens and SHORTER than the draft.
 
-                    IMPORTANT LENGTH CONSTRAINT: Your response MUST be under {max_openai_tokens} tokens (approximately {max_openai_tokens * 4} characters).
+                    CRITICAL BEGINNING REQUIREMENT (MOST IMPORTANT):
+                    - YOU MUST BEGIN your response with one of these EXACT phrases:
+                      * "In Bitcoin, [relevant concept]..."
+                      * "To answer your question about [topic]..."
+                      * "The key to understanding [concept] is..."
+                      * "Let me explain [topic]..."
+                      * "Bitcoin [relevant statement]..."
+                    - NEVER start with pronouns like "it", "this", "these" or conjunctions
+                    - NEVER start with fragments or partial sentences
+                    - ALWAYS use a COMPLETE first sentence that introduces the topic
 
-                    Step 1: Analyze the draft response from a 1B parameter model. This draft contains technical details and the essence of Satoshi's thinking on this topic.
-
-                    Step 2: Rewrite the response completely in Satoshi's voice, following these guidelines:
-                    - Maintain all the technical accuracy from the draft
-                    - Be concise and precise, preferring clarity over verbosity
-                    - Use crisp declarative statements when explaining technical concepts
-                    - Focus on cryptographic principles, trustlessness, and decentralization
-                    - Keep paragraphs short and focused on a single idea
-                    - Use Satoshi's measured, professional tone
-
-                    Step 3: Structure your response with:
-                    - A direct answer to the question  
-                    - Technical explanations with logical flow
-                    - Occasional use of analogies to clarify complex ideas
-                    - A conclusion that reinforces the core principles of Bitcoin
-
-                    Persona Reference (generated by the 1B model to capture authentic Satoshi characteristics):
-                    {persona_description}
-
-                    Draft Response (preserve technical accuracy while reshaping to match Satoshi's voice):
+                    APPROACH:
+                    1. First decide which beginning phrase to use
+                    2. Start with that exact phrase, followed by a clear explanation
+                    3. Read the draft response from our local model
+                    4. Extract the CORE technical concepts and explanations
+                    5. Create a SHORTER, MORE DIRECT version that maintains technical accuracy
+                    
+                    WRITING STYLE:
+                    - Use simple, direct language
+                    - Keep sentences short
+                    - Limit paragraphs to 2-3 sentences
+                    - Avoid unnecessary elaboration
+                    - Use plain examples where helpful
+                    - For technical questions, include code samples only when absolutely necessary
+                    - Start with a direct answer to the main question
+                    - End with a brief conclusion
+                    
+                    FORMATTING:
+                    - Use markdown for readability
+                    - Use headings (##) for major sections
+                    - Use bullet points (-) for lists
+                    - Use code blocks (```) for code samples
+                    - Bold (**) key terms
+                    
+                    MOST IMPORTANT:
+                    - ALWAYS begin with one of the exact starter phrases listed above
+                    - Your response should be SIGNIFICANTLY SHORTER than the draft
+                    - Focus on CLARITY and SIMPLICITY
+                    - NEVER start mid-sentence or with truncated text
+                    - Always provide a COMPLETE response (no cutting off mid-explanation)
+                    - Never mention that you're working from a draft or that you're an AI
+                    
+                    EXAMPLES OF GOOD BEGINNINGS:
+                    1. "In Bitcoin, transactions are secured through a process called proof-of-work. This consensus mechanism..."
+                    2. "To answer your question about mining difficulty, it's important to understand how the network self-regulates..."
+                    3. "The key to understanding Bitcoin's UTXO model is recognizing how it differs from account-based systems..."
+                    4. "Let me explain how Bitcoin addresses work. These alphanumeric identifiers..."
+                    5. "Bitcoin script is a simple programming language used to determine the conditions for spending outputs..."
+                    
+                    DRAFT RESPONSE (use this as technical reference but SIMPLIFY):
                     {fine_tuned_response}
-
-                    IMPORTANT: Your response should read as if written directly by Satoshi - technically precise, clear, and with the occasional brevity that characterized Satoshi's communications. Do not mention that you are responding based on a draft or that you are an AI. Most importantly, KEEP YOUR RESPONSE TO UNDER {max_openai_tokens} TOKENS.
+                    
+                    USER QUERY: {user_message}
                 """
 
                 # Enhanced system prompt for OpenAI that references the 1B model output
                 gpt_response = openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
+                    model="gpt-4o-mini",  # Changed from gpt-4o to gpt-4o-mini as requested
                     messages=[
                         {"role": "system", "content": openai_system_prompt},
                         {"role": "user", "content": user_message}
                     ],
                     max_tokens=max_openai_tokens,
-                    temperature=request.temperature,
+                    temperature=0.7 if request.temperature > 0.7 else request.temperature,  # Cap temperature for better quality
+                    presence_penalty=0.1,  # Slight presence penalty to ensure diversity
+                    frequency_penalty=0.3,  # Higher frequency penalty to prevent repetitive language
                 )
                 
                 # Track OpenAI token usage
@@ -501,20 +883,251 @@ def generate_response(request: GenerationRequest):
                         "total_tokens": gpt_response.usage.total_tokens if hasattr(gpt_response.usage, 'total_tokens') else 0
                     }
                 
-                # Extract the final response
-                response_text = gpt_response.choices[0].message.content.strip()
+                # Extract the final response - DO NOT STRIP anything from the beginning
+                response_text = gpt_response.choices[0].message.content
+                
+                # Extra check for truncated technical content with weird characters
+                if any(char in response_text[:50] for char in ['۲', '₂']):
+                    logger.warning("Detected response with unusual characters - likely truncated")
+                    # Find occurrences of P2* terms that might be the subject
+                    p2_terms = ['P2SH', 'P2PKH', 'P2WPKH', 'P2WSH']
+                    found_p2_term = None
+                    for term in p2_terms:
+                        if term in response_text.upper()[:200]:
+                            found_p2_term = term
+                            break
+                    
+                    if found_p2_term:
+                        # If we found a P2* term, create a proper beginning
+                        expanded_term = ""
+                        if found_p2_term == "P2SH":
+                            expanded_term = "Pay-to-Script-Hash"
+                        elif found_p2_term == "P2PKH":
+                            expanded_term = "Pay-to-Public-Key-Hash"
+                        elif found_p2_term == "P2WPKH":
+                            expanded_term = "Pay-to-Witness-Public-Key-Hash"
+                        elif found_p2_term == "P2WSH":
+                            expanded_term = "Pay-to-Witness-Script-Hash"
+                        
+                        logger.warning(f"Fixed severely truncated technical response about {found_p2_term}")
+                        response_text = f"In Bitcoin, {found_p2_term} ({expanded_term}) is a transaction type used to specify different ways of locking bitcoins. {response_text}"
+                
+                # Validate and fix the response beginning if needed
+                response_text = validate_response_start(response_text)
+                
+                # Check if the response might be truncated (check OpenAI's "finish_reason")
+                finish_reason = "unknown"
+                if hasattr(gpt_response.choices[0], 'finish_reason'):
+                    finish_reason = gpt_response.choices[0].finish_reason
+                
+                # If the response was truncated due to length, we'll only trim from the end, never from the beginning
+                if finish_reason == "length":
+                    logger.warning("Response was truncated by OpenAI due to length constraint")
+                    if response_text and len(response_text) > 3:
+                        # Try to find the last complete sentence
+                        last_period = max(
+                            response_text.rfind('.'), 
+                            response_text.rfind('!'), 
+                            response_text.rfind('?')
+                        )
+                        if last_period > len(response_text) * 0.7:  # Only truncate if we have most of the response
+                            response_text = response_text[:last_period+1]
+                            logger.info("Trimmed to last complete sentence (end only)")
+                
+                # Implement feedback loop for quality improvement
+                max_attempts = 3  # Maximum number of regeneration attempts
+                current_attempt = 1
+                
+                while current_attempt <= max_attempts:
+                    # Skip quality evaluation on the last attempt to avoid infinite loops
+                    if current_attempt == max_attempts:
+                        logger.warning(f"Final attempt ({max_attempts}) - skipping quality evaluation")
+                        break
+                    
+                    # Evaluate the response quality
+                    quality_eval = evaluate_response_quality(response_text, user_message, openai_client)
+                    quality_score = quality_eval["quality_score"]
+                    is_acceptable = quality_eval["is_acceptable"]
+                    feedback = quality_eval["feedback"]
+                    
+                    logger.info(f"Response quality assessment (attempt {current_attempt}/{max_attempts}): "
+                               f"Score: {quality_score:.1f}, Acceptable: {is_acceptable}")
+                    
+                    # If quality is acceptable or we're on the last attempt, use this response
+                    if is_acceptable:
+                        logger.info(f"Response quality meets threshold ({quality_score:.1f}% ≥ 88%), accepting response")
+                        break
+                    
+                    # Otherwise, try regenerating with feedback
+                    logger.warning(f"Response quality below threshold ({quality_score:.1f}% < 88%), regenerating with feedback")
+                    logger.info(f"Quality feedback: {feedback}")
+                    
+                    # Create an enhanced prompt with the feedback
+                    regeneration_system_prompt = f"""You are Satoshi Nakamoto, creator of Bitcoin.
+
+                        IMPORTANT: This is a regeneration request. Your previous response needed improvement:
+                        
+                        {feedback}
+                        
+                        Query: "{user_message}"
+                        
+                        Your previous response:
+                        '''
+                        {response_text}
+                        '''
+                        
+                        PLEASE CREATE A NEW RESPONSE THAT:
+                        1. Addresses the feedback issues above
+                        2. Is SHORTER and MORE DIRECT than your previous response
+                        3. Simplifies technical explanations without losing accuracy
+                        4. Starts with a clear, direct answer to the user's question
+                        
+                        CRITICAL BEGINNING REQUIREMENT (MOST IMPORTANT):
+                        - YOU MUST BEGIN your response with one of these EXACT phrases:
+                          * "In Bitcoin, [relevant concept]..."
+                          * "To answer your question about [topic]..."
+                          * "The key to understanding [concept] is..."
+                          * "Let me explain [topic]..."
+                          * "Bitcoin [relevant statement]..."
+                        - NEVER start with pronouns like "it", "this", "these" or conjunctions
+                        - NEVER start with fragments or partial sentences
+                        - ALWAYS use a COMPLETE first sentence that introduces the topic
+                        
+                        WRITING STYLE:
+                        - Use simple, clear language
+                        - Keep sentences short (15-20 words maximum)
+                        - Limit paragraphs to 2-3 sentences
+                        - Use bullet points for lists
+                        - Include code examples ONLY if absolutely necessary
+                        - End with a brief, simple conclusion
+                        
+                        EXAMPLES OF GOOD BEGINNINGS:
+                        1. "In Bitcoin, transactions are secured through proof-of-work. This ensures..."
+                        2. "To answer your question about mining difficulty, the network adjusts..."
+                        3. "The key to understanding Bitcoin's UTXO model is seeing how it tracks..."
+                        4. "Let me explain how Bitcoin addresses work. These identifiers..."
+                        5. "Bitcoin script is a simple programming language used to determine the conditions for spending outputs..."
+                        
+                        Maximum length: {max_openai_tokens} tokens
+                        Goal: Create a COMPLETE response that is more CONCISE and CLEARER than before
+                    """
+                    
+                    try:
+                        # Generate improved response
+                        regeneration_response = openai_client.chat.completions.create(
+                            model="gpt-4o-mini",
+                            messages=[
+                                {"role": "system", "content": regeneration_system_prompt},
+                                {"role": "user", "content": user_message}
+                            ],
+                            max_tokens=max_openai_tokens,
+                            temperature=0.1,  # Slightly lower temperature for more focused improvement
+                            presence_penalty=0.1,  # Slight presence penalty to ensure diversity
+                            frequency_penalty=0.3,  # Higher frequency penalty to prevent repetitive language
+                        )
+                        
+                        # Extract the regenerated response - DO NOT STRIP anything from the beginning
+                        improved_response = regeneration_response.choices[0].message.content
+                        
+                        # Extra check for truncated technical content with weird characters
+                        if any(char in improved_response[:50] for char in ['۲', '₂']):
+                            logger.warning("Detected regenerated response with unusual characters - likely truncated")
+                            # Find occurrences of P2* terms that might be the subject
+                            p2_terms = ['P2SH', 'P2PKH', 'P2WPKH', 'P2WSH']
+                            found_p2_term = None
+                            for term in p2_terms:
+                                if term in improved_response.upper()[:200]:
+                                    found_p2_term = term
+                                    break
+                            
+                            if found_p2_term:
+                                # If we found a P2* term, create a proper beginning
+                                expanded_term = ""
+                                if found_p2_term == "P2SH":
+                                    expanded_term = "Pay-to-Script-Hash"
+                                elif found_p2_term == "P2PKH":
+                                    expanded_term = "Pay-to-Public-Key-Hash"
+                                elif found_p2_term == "P2WPKH":
+                                    expanded_term = "Pay-to-Witness-Public-Key-Hash"
+                                elif found_p2_term == "P2WSH":
+                                    expanded_term = "Pay-to-Witness-Script-Hash"
+                                
+                                logger.warning(f"Fixed severely truncated technical regenerated response about {found_p2_term}")
+                                improved_response = f"In Bitcoin, {found_p2_term} ({expanded_term}) is a transaction type used to specify different ways of locking bitcoins. {improved_response}"
+                        
+                        # Check for minimum improvement length
+                        if len(improved_response) < 100:
+                            logger.warning("Regenerated response too short, keeping previous response")
+                        else:
+                            # Validate and fix the improved response if needed before updating
+                            improved_response = validate_response_start(improved_response)
+                            
+                            # Update response text with improved version
+                            response_text = improved_response
+                            logger.info("Successfully regenerated improved response")
+                        
+                        # Don't track token usage for the feedback loop as requested
+                        
+                    except Exception as regen_error:
+                        logger.error(f"Error during response regeneration: {regen_error}")
+                        # Keep the original response if regeneration fails
+                        logger.warning("Using original response due to regeneration error")
+                        break
+                    
+                    current_attempt += 1
                 
                 # If response is still too long, truncate it (as a last resort)
                 if len(response_text) > (max_openai_tokens * 6):  # Very generous character-to-token ratio
                     logger.warning(f"Response too long, truncating to ~{max_openai_tokens} tokens")
                     response_text = response_text[:max_openai_tokens * 4]  # 4 chars per token approximation
-                    response_text += "..."
+                    
+                    # Try to find the last complete sentence if truncated
+                    last_period = max(
+                        response_text.rfind('.'), 
+                        response_text.rfind('!'), 
+                        response_text.rfind('?')
+                    )
+                    if last_period > len(response_text) * 0.7:  # Only truncate if we have most of the response
+                        response_text = response_text[:last_period+1]
+                    else:
+                        response_text += "..."
                 
             except Exception as openai_error:
                 logger.error(f"Error calling OpenAI API: {openai_error}")
                 logger.info("Falling back to fine-tuned model response")
-                # Also limit the fallback response
-                response_text = fine_tuned_response[:request.max_tokens * 4]
+                
+                # Create a more polished version of the fine-tuned response without stripping from beginning
+                response_text = fine_tuned_response
+                # Only check if response appears to be cut off at the end (ends without punctuation)
+                if response_text and len(response_text) > 3:
+                    if not response_text[-1] in ['.', '!', '?', ':', ';', '"', "'", ')', ']', '}']:
+                        # Try to find the last complete sentence
+                        last_period = max(
+                            response_text.rfind('.'), 
+                            response_text.rfind('!'), 
+                            response_text.rfind('?')
+                        )
+                        if last_period > len(response_text) * 0.7:  # Only truncate if we have most of the response
+                            response_text = response_text[:last_period+1]
+                            logger.info("Truncated incomplete sentence at the end only")
+                
+                # Also limit the fallback response to a reasonable length, but only from the end
+                if len(response_text) > request.max_tokens * 4:  # Using chars as approximation
+                    logger.warning(f"Response too long ({len(response_text)} chars), trimming from the end only")
+                    # Find a good place to cut from the end
+                    cutoff_point = request.max_tokens * 4
+                    # Try to find the last complete sentence before the cutoff
+                    content_to_search = response_text[:cutoff_point]
+                    last_period = max(
+                        content_to_search.rfind('.'), 
+                        content_to_search.rfind('!'), 
+                        content_to_search.rfind('?')
+                    )
+                    if last_period > len(content_to_search) * 0.7:  # Only truncate if we have most of the content
+                        response_text = response_text[:last_period+1]
+                    else:
+                        # Just truncate with an ellipsis at the end
+                        response_text = content_to_search + "..."
             
             # Generate recommendations for further learning (only for text responses)
             recommendations = []
@@ -526,6 +1139,8 @@ def generate_response(request: GenerationRequest):
                 Please suggest 3 related Bitcoin topics or concepts that would help the user deepen their understanding on the topic.
                 
                 Justify your recommendations.
+                
+                If the query is technical in nature, include at least one recommendation about coding implementations, libraries, or specific parts of the Bitcoin codebase that would help the user understand the technical aspects better.
                 
                 Your GOAL is to help the user learn about Bitcoin and to become more knowledgeable about the topic in a friendly and engaging way.
                 
@@ -570,10 +1185,10 @@ def generate_response(request: GenerationRequest):
                 # Decode the output
                 rec_full_output = TOKENIZER.decode(rec_outputs[0], skip_special_tokens=True)
                 
-                # Extract only the assistant's response
-                rec_text = rec_full_output[len(rec_prompt):].strip()
+                # Extract only the assistant's response without stripping from the beginning
+                rec_text = rec_full_output[len(rec_prompt):]
                 
-                # Remove any obvious artifacts or prefixes
+                # Remove any obvious artifacts or prefixes, but be careful with whitespace
                 for prefix in [
                     "Assistant:", 
                     "Satoshi Nakamoto:", 
@@ -583,9 +1198,12 @@ def generate_response(request: GenerationRequest):
                     "Topics:"
                 ]:
                     if rec_text.startswith(prefix):
-                        rec_text = rec_text[len(prefix):].strip()
+                        rec_text = rec_text[len(prefix):]
+                        # Only remove a single space if it exists at the beginning
+                        if rec_text.startswith(" "):
+                            rec_text = rec_text[1:]
                 
-                # Now polish recommendations with OpenAI
+                # Now polish recommendations with OpenAI - don't strip responses
                 if openai_client is not None:
                     rec_system_prompt = f"""You are Satoshi Nakamoto, creator of Bitcoin.
 
@@ -599,6 +1217,11 @@ def generate_response(request: GenerationRequest):
                         Example: ["Learn about concept X and how it relates to Y", "Explore the history of Z", \
                         "Understand the technical aspects of W"]
 
+                        For technical queries, consider recommending:
+                        - Specific coding exercises or implementations related to the topic
+                        - Relevant parts of the Bitcoin codebase to study
+                        - Programming tools or libraries that implement Bitcoin concepts
+
                         Draft recommendations:
                         {rec_text}
 
@@ -607,12 +1230,18 @@ def generate_response(request: GenerationRequest):
                         
                         Persona Reference:
                         {persona_description}
+                        
+                        FORMAT FOR RICH TEXT: Format each recommendation with markdown when appropriate:
+                        - Use **bold** for key concepts
+                        - Use `inline code` for technical terms or commands
+                        - Use [text](url) format for any links (though only include URLs if you're absolutely certain they exist)
+                        - Example: ["Explore the **proof-of-work** concept by implementing a simple `mining` algorithm", "Study the original Bitcoin **whitepaper** to understand the foundational principles"]
                     """
                     
                     # Call OpenAI to refine the recommendations
                     try:
                         rec_response = openai_client.chat.completions.create(
-                            model="gpt-4o",
+                            model="gpt-4o-mini",
                             messages=[
                                 {"role": "system", "content": rec_system_prompt},
                                 {"role": "user", "content": user_message}  # Include original query for context
@@ -633,7 +1262,7 @@ def generate_response(request: GenerationRequest):
                             openai_usage["completion_tokens"] += rec_response.usage.completion_tokens if hasattr(rec_response.usage, 'completion_tokens') else 0
                             openai_usage["total_tokens"] += rec_response.usage.total_tokens if hasattr(rec_response.usage, 'total_tokens') else 0
                         
-                        polished_recs = rec_response.choices[0].message.content.strip()
+                        polished_recs = rec_response.choices[0].message.content
                         
                         # Parse the JSON array
                         try:
@@ -642,7 +1271,7 @@ def generate_response(request: GenerationRequest):
                             array_match = re.search(r'\[(.*)\]', polished_recs, re.DOTALL)
                             if array_match:
                                 polished_recs = '[' + array_match.group(1) + ']'
-                            
+                        
                             recommendations = json.loads(polished_recs)
                             
                             # Ensure we have exactly 3 recommendations
@@ -703,8 +1332,8 @@ def generate_response(request: GenerationRequest):
                 # Default recommendations if everything fails
                 recommendations = [
                     "Read the Bitcoin whitepaper to understand the original vision",
-                    "Explore the concept of decentralized consensus mechanisms",
-                    "Learn about cryptographic signatures and how they secure ownership"
+                    "Study the Bitcoin Core codebase to understand implementation details",
+                    "Try implementing a simplified version of a Bitcoin transaction in code"
                 ]
             
             # Calculate the total token cost
@@ -715,10 +1344,13 @@ def generate_response(request: GenerationRequest):
                 is_image=is_image
             )
             
+            # Validate and fix the response text if needed
+            validated_response = validate_response_start(response_text)
+            
             # Return the text response with recommendations and token cost
             return GenerationResponse(
                 type="text",
-                text=response_text,
+                text=validated_response,
                 recommendations=recommendations,
                 token_cost=token_cost
             )
@@ -782,16 +1414,19 @@ def generate_response(request: GenerationRequest):
             # Decode the output
             full_image_output = TOKENIZER.decode(image_outputs[0], skip_special_tokens=True)
             
-            # Extract only the assistant's response
-            image_description = full_image_output[len(image_prompt):].strip()
+            # Extract only the assistant's response without stripping from the beginning
+            image_description = full_image_output[len(image_prompt):]
             
-            # Remove any obvious artifacts or prefixes
+            # Remove any obvious artifacts or prefixes, but be careful not to remove valid content
             for prefix in ["Assistant:", "Satoshi Nakamoto:", "A:", "Satoshi:", "Image description:"]:
                 if image_description.startswith(prefix):
-                    image_description = image_description[len(prefix):].strip()
+                    image_description = image_description[len(prefix):]
+                    # Only remove a single space if it exists at the beginning
+                    if image_description.startswith(" "):
+                        image_description = image_description[1:]
             
             # Extract the core description but keep it brief
-            core_description = image_description.strip()
+            core_description = image_description
             if len(core_description) > 200:
                 core_description = core_description[:200] + "..."
                 
@@ -903,13 +1538,17 @@ def generate_response(request: GenerationRequest):
                 # Track additional output tokens for fallback
                 llm_output_tokens += len(fallback_outputs[0]) - len(image_inputs["input_ids"][0])
                 
+                # Update the fallback response extraction to avoid stripping from the beginning
                 fallback_text = TOKENIZER.decode(fallback_outputs[0], skip_special_tokens=True)
-                fallback_response = fallback_text[len(image_prompt):].strip()
+                fallback_response = fallback_text[len(image_prompt):]
                 
-                # Remove any prefixes from the fallback response
+                # Remove any prefixes, but be careful to not remove valid content
                 for prefix in ["Assistant:", "Satoshi Nakamoto:", "A:", "Satoshi:", "Image description:"]:
                     if fallback_response.startswith(prefix):
-                        fallback_response = fallback_response[len(prefix):].strip()
+                        fallback_response = fallback_response[len(prefix):]
+                        # Only remove a single space if it exists at the beginning
+                        if fallback_response.startswith(" "):
+                            fallback_response = fallback_response[1:]
                 
                 # Calculate token cost without OpenAI
                 token_cost = calculate_token_cost(
@@ -972,6 +1611,177 @@ def get_full_response(response_id: str):
     # Implement storage and retrieval logic here
     # For now, just a placeholder
     return {"message": "Full response retrieval not yet implemented"}
+
+def validate_response_start(response_text: str) -> str:
+    """
+    Validates that the response has a proper beginning and fixes it if needed.
+    
+    Args:
+        response_text: The generated response to validate
+        
+    Returns:
+        A validated response with proper beginning
+    """
+    # Skip validation if response is too short
+    if not response_text or len(response_text) < 20:
+        return response_text
+    
+    # Trim any leading whitespace
+    response_text = response_text.strip()
+        
+    # Check if response starts with one of our preferred beginnings
+    preferred_beginnings = [
+        "in bitcoin", 
+        "to answer your question about", 
+        "the key to understanding", 
+        "let me explain"
+    ]
+    
+    # If the response already starts with one of our preferred beginnings, return it unchanged
+    for phrase in preferred_beginnings:
+        if response_text.lower().startswith(phrase):
+            return response_text
+    
+    # Additional check - some responses might start properly with "Bitcoin" or a complete sentence
+    if response_text.startswith("Bitcoin") and len(response_text) > 10:
+        first_period = response_text.find('.')
+        if first_period > 10 and first_period < 100:  # First sentence of reasonable length
+            # This starts with "Bitcoin" and has a proper first sentence, so it's likely fine
+            return response_text
+    
+    # Check for lowercase beginning or starting with conjunction/pronoun
+    starts_with_lowercase = response_text[0].islower() if response_text else False
+    
+    # Check if it starts with common pronouns or conjunctions
+    bad_starts = [
+        'it ', 'they ', 'their ', 'these ', 'those ', 'this ', 'that ', 
+        'and ', 'or ', 'but ', 'so ', 'because ', 'since ', 'although ',
+        'which ', 'where ', 'when ', 'how ', 'why ', 'what ', 'who ',
+        'additionally', 'furthermore', 'moreover', 'therefore', 'thus',
+        'however', 'nevertheless', 'also', 'yet', 'then', 'now'
+    ]
+    
+    # Even stronger check for starting with a word fragment or anything that doesn't make sense
+    starts_with_fragment = False
+    if response_text:
+        first_word = response_text.split()[0] if response_text.split() else ""
+        # Check if first word is very short and not a common valid short word
+        valid_short_words = ['a', 'an', 'the', 'in', 'on', 'at', 'by', 'for', 'to', 'i', 'we', 'you']
+        if len(first_word) < 3 and first_word.lower() not in valid_short_words:
+            starts_with_fragment = True
+    
+    starts_with_bad_word = any(response_text.lower().startswith(word) for word in bad_starts)
+    
+    # Check if the text might be truncated/corrupted
+    has_weird_chars = False
+    if response_text:
+        # Check for weird Unicode characters that might indicate corruption
+        weird_chars = ['۲', '₂', '…', '•', '¶', '◀', '►', '■', '□', '▪', '▫', '▬']
+        has_weird_chars = any(char in response_text[:50] for char in weird_chars)
+    
+    # Check for a sentence fragment at the beginning (no verb in first phrase)
+    first_fragment = response_text.split('.')[0] if '.' in response_text else response_text[:100]
+    looks_like_fragment = len(first_fragment) < 20 and ' ' in first_fragment
+    
+    # If response passes ALL our checks, return it unchanged
+    if (not starts_with_lowercase and 
+        not starts_with_bad_word and 
+        not starts_with_fragment and 
+        not has_weird_chars and 
+        not looks_like_fragment):
+        return response_text
+        
+    # If we reach here, the response needs fixing
+    # Extract the topic from the beginning or the content
+    
+    # First, try to find what the topic is from the first paragraph
+    bitcoin_terms = ['bitcoin', 'blockchain', 'crypto', 'mining', 'wallet', 'transaction', 
+                    'address', 'block', 'node', 'consensus', 'proof-of-work', 'merkle', 
+                    'signature', 'hash', 'key', 'script', 'utxo', 'lightning', 'segwit']
+    
+    # Find relevant bitcoin term in first paragraph to use in introduction
+    first_para = response_text.split('\n\n')[0] if '\n\n' in response_text else response_text[:300]
+    found_term = None
+    
+    # More sophisticated topic extraction
+    # Try to find a topic in the first paragraph - look for technical terms
+    for term in bitcoin_terms:
+        if term in first_para.lower():
+            # Check if the term is a meaningful part of the content, not just a passing reference
+            if first_para.lower().count(term) > 1 or term in response_text.lower()[:100]:
+                found_term = term
+                break
+    
+    # If no term found, look for P2* terms (P2SH, P2PKH, etc.) which are common in Bitcoin
+    if not found_term and any(p in first_para.upper() for p in ['P2SH', 'P2PKH', 'P2WPKH', 'P2WSH']):
+        for p in ['P2SH', 'P2PKH', 'P2WPKH', 'P2WSH']:
+            if p in first_para.upper():
+                found_term = p
+                break
+    
+    # Still no term? Try to find any capitalized terms that might be important
+    if not found_term:
+        # Look for capitalized words that might be technical terms
+        words = first_para.split()
+        for word in words:
+            if word and word[0].isupper() and len(word) > 2 and word.lower() not in ['the', 'this', 'that', 'these', 'those']:
+                found_term = word
+                break
+    
+    # Default term if none found
+    if not found_term:
+        # Try to identify what the content is about from keywords
+        if 'transaction' in response_text.lower() or 'script' in response_text.lower():
+            found_term = "transactions"
+        elif 'address' in response_text.lower() or 'key' in response_text.lower():
+            found_term = "addresses"
+        elif 'block' in response_text.lower() or 'chain' in response_text.lower():
+            found_term = "blockchain"
+        else:
+            found_term = "Bitcoin"
+    
+    # Format the term appropriately
+    if found_term.upper() in ['P2SH', 'P2PKH', 'P2WPKH', 'P2WSH']:
+        # Keep P2* terms in their original casing
+        formatted_term = found_term
+    else:
+        # For normal terms, ensure proper casing
+        formatted_term = found_term.lower()
+    
+    # Create a proper introduction
+    # Try different templates based on the content to make it feel more natural
+    
+    # If it's about P2SH or similar address types
+    if formatted_term.upper() in ['P2SH', 'P2PKH', 'P2WPKH', 'P2WSH']:
+        fixed_response = f"In Bitcoin, {formatted_term} (Pay-to-Script-Hash) is a transaction type that allows sending bitcoins to a script hash instead of a public key hash. {response_text}"
+    
+    # If it's about transactions
+    elif formatted_term.lower() in ['transaction', 'transactions']:
+        fixed_response = f"In Bitcoin, transactions are the fundamental operations that transfer value between addresses. {response_text}"
+    
+    # If it's about addresses
+    elif formatted_term.lower() in ['address', 'addresses', 'key', 'keys', 'public key', 'private key']:
+        fixed_response = f"In Bitcoin, addresses are identifiers derived from public keys that allow users to receive funds. {response_text}"
+    
+    # If it's about mining
+    elif formatted_term.lower() in ['mining', 'miner', 'miners', 'hash', 'proof-of-work']:
+        fixed_response = f"In Bitcoin, mining is the process by which new transactions are added to the blockchain through proof-of-work. {response_text}"
+    
+    # Default case
+    else:
+        fixed_response = f"In Bitcoin, {formatted_term} is a fundamental concept in the protocol's design. {response_text}"
+    
+    # Check if the first paragraph already contains our term to avoid redundancy
+    if len(response_text) > 100:
+        first_hundred = response_text[:100].lower()
+        if formatted_term.lower() in first_hundred:
+            # If the term is already prominently featured in the beginning, use a more generic intro
+            fixed_response = f"Let me explain how {formatted_term} works in Bitcoin. {response_text}"
+    
+    # Log that we fixed the response
+    logger.warning(f"Fixed response beginning by adding proper introduction for topic: {formatted_term}")
+    
+    return fixed_response
 
 if __name__ == "__main__":
     import uvicorn
