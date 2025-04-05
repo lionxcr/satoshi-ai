@@ -8,6 +8,7 @@
 # Docker and configuration files
 !docker-compose.yml
 !Dockerfile.gpu
+!Dockerfile
 !.env.example
 !run.sh
 

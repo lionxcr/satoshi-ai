@@ -2,7 +2,7 @@ import os
 import json
 import logging
 from typing import List, Optional, Literal
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Header
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
@@ -37,6 +37,9 @@ logging.getLogger("httpx").setLevel(logging.ERROR)
 
 # Get logger for this module - will also use ERROR level from the basicConfig
 logger = logging.getLogger(__name__)
+
+# Get API key from environment variables
+API_KEY = os.environ.get("API_KEY")
 
 # Global variables to cache the model and tokenizer
 MODEL = None
@@ -75,6 +78,21 @@ class GenerationResponse(BaseModel):
     recommendations: Optional[List[str]] = None  # Add a field for recommendations
     token_cost: Optional[int] = None  # Changed from float to int
 
+# Dependency function to check API key
+async def verify_api_key(x_api_key: str = Header(None)):
+    """
+    Verify that the request contains a valid API key in the 'x-api-key' header.
+    """
+    if x_api_key is None or x_api_key == "":
+        logger.error("API key is missing")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    if x_api_key != API_KEY:
+        logger.error("Invalid API key")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    return x_api_key
+
 @app.on_event("startup")
 def startup_event():
     """Load the base model and LoRA adapter, along with the tokenizer and initialize clients."""
@@ -99,7 +117,7 @@ def startup_event():
         raise e
 
 @app.post("/generate")
-def generate_response(request: GenerationRequest):
+def generate_response(request: GenerationRequest, api_key: str = Depends(verify_api_key)):
     """
     POST endpoint that generates a response based on the provided messages.
     If output_type is 'text', returns text response.
@@ -563,7 +581,7 @@ def generate_response(request: GenerationRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/admin/refresh_persona")
-def refresh_persona():
+def refresh_persona(api_key: str = Depends(verify_api_key)):
     """Admin endpoint to refresh the cached Satoshi persona."""
     global SATOSHI_PERSONA, MODEL, TOKENIZER
     
@@ -574,7 +592,7 @@ def refresh_persona():
         raise HTTPException(status_code=500, detail=f"Failed to refresh persona: {str(e)}")
 
 @app.get("/admin/view_persona")
-def view_persona():
+def view_persona(api_key: str = Depends(verify_api_key)):
     """Admin endpoint to view the cached Satoshi persona."""
     global SATOSHI_PERSONA
     

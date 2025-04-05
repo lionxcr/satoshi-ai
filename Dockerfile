@@ -6,28 +6,23 @@ WORKDIR /app
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    wget \
-    git \
     curl \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements file
+# Copy requirements file and install Python dependencies
 COPY requirements.txt .
-
-# Install Python dependencies with appropriate GPU packages
-RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir torch>=2.0.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .
 
-# Create necessary directories for temporary files and model cache
-RUN mkdir -p temp models && chmod -R 777 temp models
+# Create a directory for temporary files and set proper permissions
+RUN mkdir -p temp && chmod 777 temp
 
 # Expose port 443 for HTTPS traffic
 EXPOSE 443
 
 # Start the application using Uvicorn with HTTPS support.
-# Ensure that your SSL certificate and key are available at /certs/cert.pem and /certs/key.pem.
+# Ensure your SSL key and certificate are available at /certs/key.pem and /certs/cert.pem.
 CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "443", "--ssl-keyfile", "/certs/key.pem", "--ssl-certfile", "/certs/cert.pem"]
