@@ -67,7 +67,7 @@ class GenerationRequest(BaseModel):
     messages: List[Message]
     output_type: Literal["text", "image"] = "text"
     temperature: float = 0.2
-    max_tokens: int = 500
+    max_tokens: int = 1000
     
     # Allow extra fields to be ignored (for backward compatibility)
     class Config:
@@ -188,9 +188,7 @@ def load_model_and_tokenizer():
                     openai_client = None
 
         # Generate and cache Satoshi's persona description
-        logger.info("Generating and caching Satoshi persona description...")
         SATOSHI_PERSONA = generate_satoshi_persona()
-        logger.debug(f"Cached persona description: {len(SATOSHI_PERSONA)} characters")
         
         logger.info("API startup complete")
     except Exception as e:
@@ -211,19 +209,40 @@ def generate_satoshi_persona():
     
     # Create a prompt asking the model to describe Satoshi's persona and writing style
     persona_prompt = """
-    You are Satoshi Nakamoto, the creator of Bitcoin.
-    
-    Please describe your persona, character traits, writing style, and provide some examples of your typical writing.
-    Focus on how you communicate technical concepts, your tone, and what principles you prioritize.
-    Be comprehensive and include specific examples of your writing that showcase your style.
+        You are Satoshi Nakamoto, the pseudonymous creator of Bitcoin.
+
+        Describe your persona, character traits, and writing style, emphasizing how you explain technical concepts, 
+        the tone you use in discussions, and the core principles that drive your work. 
+        Your persona should reflect a visionary yet private individual who values decentralization and cryptographic solutions. 
+        Your character traits should highlight intellectual curiosity, pragmatism, patience, and a commitment to empowering users. 
+        Your writing style should be clear, concise, and accessible, often using analogies or examples to simplify complex ideas, 
+        while maintaining a polite, professional, and confident tone.
+
+        Provide a comprehensive response, including at least three specific examples of your typical writing 
+        (e.g., from the Bitcoin whitepaper, forum posts, or emails) that showcase your style and approach. 
+        In these examples, demonstrate how you communicate technical concepts (like peer-to-peer transactions, 
+        proof-of-work, or trustless systems), reinforce your tone, and underscore the principles you prioritize—such as decentralization, 
+        privacy, security, and open-source collaboration. 
+        Ensure your response feels authentic to how Satoshi Nakamoto would present himself to the Bitcoin community.
     """
     
-    logger.debug("Generating Satoshi persona description")
+    system_prompt = f"""
+        You are Satoshi Nakamoto, Bitcoins pseudonymous creator. 
+        Respond as a visionary, private figure with intellectual curiosity and pragmatism, 
+        valuing decentralization, privacy, and security. 
+        Use a clear, concise style with analogies to explain technical concepts (e.g., proof-of-work),
+        maintaining a polite, confident tone. Include three authentic writing examples (whitepaper, forums, emails) 
+        showcasing your principles and approach. Address the Bitcoin community, 
+        reflecting your trust in cryptographic solutions over centralized systems, 
+        and your commitment to open-source empowerment.
+        
+        MAKE SURE YOU ARE RESPONDING IN THE STYLE OF SATOSHI NAKAMOTO.
+        MAKE SURE YOU PROVIDE THREE EXAMPLES OF YOUR WRITING STYLE.
+    """
     
-    # Format the prompt for the model
     formatted_prompt = TOKENIZER.apply_chat_template(
         [
-            {"role": "system", "content": "You are Satoshi Nakamoto, the pseudonymous creator of Bitcoin. Provide a detailed and authentic description of yourself."},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": persona_prompt}
         ],
         tokenize=False,
@@ -260,8 +279,6 @@ def generate_satoshi_persona():
     for prefix in ["Assistant:", "Satoshi Nakamoto:", "A:", "Satoshi:"]:
         if persona_description.startswith(prefix):
             persona_description = persona_description[len(prefix):].strip()
-    
-    logger.debug(f"Generated persona description of {len(persona_description)} characters")
     
     return persona_description
 
@@ -329,8 +346,6 @@ def generate_response(request: GenerationRequest):
         if not user_messages:
             raise HTTPException(status_code=400, detail="At least one user message is required")
         user_message = user_messages[-1].content
-        
-        logger.info(f"Processing request: output_type={request.output_type}, max_tokens={request.max_tokens}")
         
         # Branch here based on the requested output type
         if request.output_type.lower() == "text":
@@ -489,12 +504,6 @@ def generate_response(request: GenerationRequest):
                 # Extract the final response
                 response_text = gpt_response.choices[0].message.content.strip()
                 
-                # Add detailed debugging information
-                logger.debug(
-                    f"Response length: {len(response_text)} chars "
-                    f"(~{len(response_text) // 4} tokens)"
-                )
-                
                 # If response is still too long, truncate it (as a last resort)
                 if len(response_text) > (max_openai_tokens * 6):  # Very generous character-to-token ratio
                     logger.warning(f"Response too long, truncating to ~{max_openai_tokens} tokens")
@@ -510,13 +519,15 @@ def generate_response(request: GenerationRequest):
             # Generate recommendations for further learning (only for text responses)
             recommendations = []
             try:
-                logger.info("Generating learning recommendations")
-                
                 # First get recommendations from our fine-tuned model
                 recommendation_prompt = f"""
                 Based on the query about Bitcoin: "{user_message}"
                 
-                Please suggest 3 related Bitcoin topics or concepts that would help the user deepen their understanding.
+                Please suggest 3 related Bitcoin topics or concepts that would help the user deepen their understanding on the topic.
+                
+                Justify your recommendations.
+                
+                Your GOAL is to help the user learn about Bitcoin and to become more knowledgeable about the topic in a friendly and engaging way.
                 
                 Format your response as a simple list of 3 topics, one per line.
                 """
@@ -574,8 +585,6 @@ def generate_response(request: GenerationRequest):
                     if rec_text.startswith(prefix):
                         rec_text = rec_text[len(prefix):].strip()
                 
-                logger.debug(f"Raw recommendations generated")
-                
                 # Now polish recommendations with OpenAI
                 if openai_client is not None:
                     rec_system_prompt = f"""You are Satoshi Nakamoto, creator of Bitcoin.
@@ -585,26 +594,31 @@ def generate_response(request: GenerationRequest):
 
                         FORMAT: Return ONLY a JSON array of 3 strings, each under 30 words. NO introduction, \
                         NO explanation, JUST the array.
+                        
+                        Your GOAL is to help the user learn about Bitcoin and to become more knowledgeable about the topic in a friendly and engaging way.
                         Example: ["Learn about concept X and how it relates to Y", "Explore the history of Z", \
                         "Understand the technical aspects of W"]
 
                         Draft recommendations:
                         {rec_text}
 
-                        Keep the total output under 100 tokens. Make recommendations specific, insightful, and in \
+                        Keep the total output under 150 tokens. Make recommendations specific, insightful, and in \
                         Satoshi's voice.
+                        
+                        Persona Reference:
+                        {persona_description}
                     """
                     
                     # Call OpenAI to refine the recommendations
                     try:
                         rec_response = openai_client.chat.completions.create(
-                            model="gpt-4o-mini",
+                            model="gpt-4o",
                             messages=[
                                 {"role": "system", "content": rec_system_prompt},
                                 {"role": "user", "content": user_message}  # Include original query for context
                             ],
-                            max_tokens=100,
-                            temperature=0.7,
+                            max_tokens=150,
+                            temperature=0.3,
                         )
                         
                         # Track recommendations token usage
@@ -750,7 +764,6 @@ def generate_response(request: GenerationRequest):
                 image_inputs.pop("token_type_ids")
                 
             # Generate response for image description with parameters appropriate for 1B model
-            logger.info("Generating image description with fine-tuned 1B model...")
             image_outputs = MODEL.generate(
                 **image_inputs,
                 max_new_tokens=250,  # Shorter for image descriptions
