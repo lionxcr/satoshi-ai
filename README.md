@@ -25,6 +25,7 @@
 - [How to Contribute](#how-to-contribute)
 - [Related Resources](#related-resources)
 - [Technical Details](#technical-details)
+- [Training Data Documentation](./Training_Data.md)
 
 ## Introduction
 
@@ -240,6 +241,12 @@ python main.py
 ```
 
 This creates properly formatted datasets in the `training-data/output` directory.
+
+> **Detailed Documentation:** For comprehensive information about the training data processing, formatting, and dataset structure, please refer to our [Training Data Documentation](./Training_Data.md). This document provides in-depth explanations of:
+> - File format processing details
+> - Data chunking and overlap methodology
+> - Dataset output formats and structure
+> - PEFT configuration parameters
 
 ### Training Process
 
@@ -529,5 +536,5 @@ The full source code is available in this repository, with detailed comments exp
 
 **Version:** 1.0.0  
 **License:** MIT  
-**Contact:** satoshi-ai@example.com  
+**Contact:** ignite@dhabiai.ae  
 **Project Status:** Active Development 
