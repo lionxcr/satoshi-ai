@@ -31,8 +31,6 @@ training-data/lnbook/
 training-data/bitcoin/
 training-data/lnd/
 
-# Ignore output directory
-/output/
 
 # Python-specific ignores
 __pycache__/

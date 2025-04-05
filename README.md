@@ -58,13 +58,9 @@ For those without access to a high-end GPU, you can use Google Colab to train th
    %cd /content/drive/MyDrive/satoshi-ai
    ```
 
-4. Clone the project repository (if using Git) or upload the required files:
+4. Clone the project repository:
    ```python
-   # Option 1: Clone from a Git repository
-   !git clone https://your-repository-url.git .
-   
-   # Option 2: Upload files manually
-   # Use the Colab file browser to upload training_model.py, requirements.txt, and other necessary files
+   !git clone https://github.com/lionxcr/satoshi-ai.git .
    ```
 
 5. Install the required dependencies:
@@ -72,7 +68,23 @@ For those without access to a high-end GPU, you can use Google Colab to train th
    !pip install -r requirements.txt
    ```
 
-6. Set up the data directory structure and upload or prepare your training data:
+6. Set up the Llama model access:
+   ```python
+   # Install Git LFS if not already installed
+   !apt-get install git-lfs
+   
+   # Clone the Llama-3.2-1B model repository (requires access credentials)
+   # Note: You'll need to authenticate with your HuggingFace credentials
+   !git lfs install
+   !git clone https://huggingface.co/meta-llama/Llama-3.2-1B
+   
+   # Alternative: Use the Hugging Face hub directly with an access token
+   !pip install huggingface_hub
+   !huggingface-cli login
+   # Then enter your token when prompted
+   ```
+
+7. Verify or create the training data directories:
    ```python
    !mkdir -p training-data/output/bitcoinbook
    !mkdir -p training-data/output/bips
@@ -80,14 +92,18 @@ For those without access to a high-end GPU, you can use Google Colab to train th
    !mkdir -p training-data/output/emails
    !mkdir -p training-data/output/posts
    
-   # Upload your training data to these directories
-   # You can use Google Drive UI or commands like:
-   # !cp /path/to/your/data/* training-data/output/bitcoinbook/
+   # If your training data is in a separate Git repository:
+   !git clone https://github.com/lionxcr/satoshi-training-data.git temp-data
+   !cp -r temp-data/* training-data/output/
+   !rm -rf temp-data
    ```
 
-7. Upload or create the PEFT configuration file:
+8. Verify the PEFT configuration file exists or create it:
    ```python
-   # Example: Creating a basic PEFT config if you don't have one
+   # Check if config exists
+   !ls -la training-data/output/persona_peft_config.json || echo "Config file not found!"
+   
+   # Create config if needed
    !cat > training-data/output/persona_peft_config.json << 'EOL'
    {
      "lora_config": {
@@ -126,7 +142,19 @@ For those without access to a high-end GPU, you can use Google Colab to train th
      %tensorboard --logdir satoshi-ai-model
      ```
 
-3. After training, compress and download the model:
+3. After training, push the results to your Git repository (optional):
+   ```python
+   # Configure Git user information
+   !git config --global user.email "your.email@example.com"
+   !git config --global user.name "Your Name"
+   
+   # Add and commit the adapter files (not the full model to save space)
+   !git add satoshi-ai-model/adapter/
+   !git commit -m "Add trained model adapter"
+   !git push origin main
+   ```
+
+4. Alternatively, compress and download the model:
    ```python
    !zip -r satoshi-ai-model.zip satoshi-ai-model/
    ```
