@@ -538,3 +538,83 @@ The full source code is available in this repository, with detailed comments exp
 **License:** MIT  
 **Contact:** ignite@dhabiai.ae  
 **Project Status:** Active Development 
+
+# Satoshi AI Docker Setup
+
+This repository contains a Docker setup for running the Satoshi AI API, which provides Bitcoin-related text and image generation capabilities using fine-tuned LLMs.
+
+## Prerequisites
+
+- Docker and Docker Compose installed
+- Hugging Face API token (for accessing models)
+- OpenAI API key (for enhanced responses and image generation)
+
+## Getting Started
+
+1. Create a `.env` file from the example:
+
+```bash
+cp .env.example .env
+```
+
+2. Edit the `.env` file and add your API keys:
+
+```
+HF_TOKEN=your_huggingface_token_here
+OPENAI_API_KEY=your_openai_api_key_here
+```
+
+3. Build and start the Docker container:
+
+```bash
+docker-compose up -d
+```
+
+4. The API will be available at `http://localhost:8080`
+
+## API Endpoints
+
+- `POST /generate` - Generate text or image responses
+- `POST /admin/refresh_persona` - Refresh the cached Satoshi persona
+- `GET /admin/view_persona` - View the cached Satoshi persona
+
+## Using GPU
+
+If you have a GPU and want to use it:
+
+1. Install the NVIDIA Container Toolkit: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+
+2. Uncomment the GPU section in `docker-compose.yml`:
+
+```yaml
+deploy:
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          count: 1
+          capabilities: [gpu]
+```
+
+3. Rebuild and restart the container:
+
+```bash
+docker-compose up -d --build
+```
+
+## Monitoring Logs
+
+```bash
+docker-compose logs -f
+```
+
+## Stopping the Container
+
+```bash
+docker-compose down
+```
+
+## Troubleshooting
+
+- If you encounter memory issues, you may need to increase the Docker memory limit.
+- If model loading is slow, consider pre-downloading models and mounting them using volumes. 
