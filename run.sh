@@ -53,6 +53,18 @@ if [ "$DEPLOY_MODE" == "cloud" ]; then
             exit 1
         fi
     done
+
+    # Optional: Domain name for SSL certificates
+    if [ ! -z "$DOMAIN_NAME" ]; then
+        echo "Domain name detected. Will set up SSL certificates."
+    fi
+
+    # Check that an active account is selected
+    ACTIVE_ACCOUNT=$(gcloud config get-value account)
+    if [ -z "$ACTIVE_ACCOUNT" ]; then
+        echo "No active gcloud account set. Please run: gcloud auth login"
+        exit 1
+    fi
 fi
 
 # Check for Docker and Docker Compose
@@ -117,32 +129,192 @@ else
         exit 1
     }
 
+    # Set up SSL certificates if domain is provided
+    if [ ! -z "$DOMAIN_NAME" ]; then
+        echo "Setting up Google Certificate Manager..."
+        # Enable required APIs if not already enabled
+        gcloud services enable certificatemanager.googleapis.com || {
+            echo "Failed to enable Certificate Manager API."
+            exit 1
+        }
+
+        # DNS authorization name based on domain
+        DNS_AUTH_NAME="satoshi-ai-dns-auth"
+        
+        # Check if DNS authorization exists, create if it doesn't
+        if ! gcloud certificate-manager dns-authorizations describe "$DNS_AUTH_NAME" --project="$PROJECT_ID" &>/dev/null; then
+            echo "Creating DNS authorization for domain verification..."
+            gcloud certificate-manager dns-authorizations create "$DNS_AUTH_NAME" \
+                --domain="$DOMAIN_NAME" \
+                --project="$PROJECT_ID" || {
+                echo "Failed to create DNS authorization."
+                exit 1
+            }
+            
+            # Get the DNS record details that need to be created
+            DNS_RECORD=$(gcloud certificate-manager dns-authorizations describe "$DNS_AUTH_NAME" \
+                --project="$PROJECT_ID" \
+                --format="value(dnsResourceRecord)")
+            
+            # Extract the data from DNS record (format: "{name} {type} {data}")
+            DNS_RECORD_DATA=(${DNS_RECORD})
+            RECORD_NAME=${DNS_RECORD_DATA[0]}
+            RECORD_TYPE=${DNS_RECORD_DATA[1]}
+            RECORD_VALUE=${DNS_RECORD_DATA[2]}
+            
+            echo "====================================================================="
+            echo "IMPORTANT: Create the following DNS record in your domain registrar:"
+            echo "Record name: $RECORD_NAME"
+            echo "Record type: $RECORD_TYPE"
+            echo "Record value: $RECORD_VALUE"
+            echo "====================================================================="
+            echo "After adding this DNS record, wait a few minutes for DNS propagation."
+            
+            # Ask user to confirm DNS record has been added
+            read -p "Have you added the DNS record? (yes/no): " DNS_CONFIRMED
+            if [[ "$DNS_CONFIRMED" != "yes" ]]; then
+                echo "Please add the DNS record and run the script again."
+                exit 1
+            fi
+        else
+            echo "Using existing DNS authorization: $DNS_AUTH_NAME"
+            
+            # Show the DNS record again in case user needs it
+            DNS_RECORD=$(gcloud certificate-manager dns-authorizations describe "$DNS_AUTH_NAME" \
+                --project="$PROJECT_ID" \
+                --format="value(dnsResourceRecord)")
+            
+            DNS_RECORD_DATA=(${DNS_RECORD})
+            RECORD_NAME=${DNS_RECORD_DATA[0]}
+            RECORD_TYPE=${DNS_RECORD_DATA[1]}
+            RECORD_VALUE=${DNS_RECORD_DATA[2]}
+            
+            echo "DNS record for verification:"
+            echo "Record name: $RECORD_NAME"
+            echo "Record type: $RECORD_TYPE"
+            echo "Record value: $RECORD_VALUE"
+        fi
+
+        # Check if certificate exists
+        CERT_NAME="satoshi-ai-cert"
+        if ! gcloud certificate-manager certificates describe "$CERT_NAME" --project="$PROJECT_ID" &>/dev/null; then
+            echo "Creating Google-managed SSL certificate with DNS verification..."
+            gcloud certificate-manager certificates create "$CERT_NAME" \
+                --domains="$DOMAIN_NAME" \
+                --dns-authorizations="$DNS_AUTH_NAME" \
+                --project="$PROJECT_ID" || {
+                echo "Failed to create certificate. Make sure DNS authorization is valid."
+                exit 1
+            }
+            
+            echo "Certificate creation initiated. This may take some time..."
+            # Wait for certificate provisioning to complete (it's an async operation)
+            for i in {1..30}; do
+                CERT_STATE=$(gcloud certificate-manager certificates describe "$CERT_NAME" --project="$PROJECT_ID" --format="value(state)")
+                if [ "$CERT_STATE" == "ACTIVE" ]; then
+                    echo "Certificate is now active and ready to use."
+                    break
+                fi
+                echo "Certificate provisioning in progress... (status: $CERT_STATE)"
+                sleep 10
+            done
+            
+            if [ "$CERT_STATE" != "ACTIVE" ]; then
+                echo "Certificate did not become active in the allotted time."
+                echo "You can check its status later with:"
+                echo "gcloud certificate-manager certificates describe $CERT_NAME --project=$PROJECT_ID"
+            fi
+        else
+            echo "Using existing certificate: $CERT_NAME"
+        fi
+        
+        # Create secrets for certificate if they don't exist
+        if ! gcloud secrets describe "ssl-cert" --project="$PROJECT_ID" &>/dev/null; then
+            echo "Creating secret for SSL certificate..."
+            gcloud secrets create "ssl-cert" --replication-policy="automatic" --project="$PROJECT_ID"
+        fi
+        
+        if ! gcloud secrets describe "ssl-key" --project="$PROJECT_ID" &>/dev/null; then
+            echo "Creating secret for SSL key..."
+            gcloud secrets create "ssl-key" --replication-policy="automatic" --project="$PROJECT_ID"
+        fi
+        
+        # Note: For managed certificates, the VM should have permission to access Google Certificate Manager
+        echo "Note: For managed certificates, ensure the VM has permissions to access Google Certificate Manager."
+    fi
+
     echo "Ensuring firewall rule for HTTPS (TCP:443) exists..."
-    # Create a firewall rule to allow HTTPS traffic on port 443 if it doesn't exist
     gcloud compute firewall-rules create allow-https \
       --allow tcp:443 \
       --target-tags=http-server \
       --quiet || echo "Firewall rule 'allow-https' already exists or was updated."
 
-    echo "Deploying container to Google Compute Engine..."
-    # Create a GCE instance that runs the container.
-    # We use preemptible instance with an NVIDIA T4 GPU.
-    # Note: The container must listen on port 443 to serve HTTPS.
-    gcloud compute instances create-with-container "${INSTANCE_NAME}" \
-      --zone="${REGION}-a" \
-      --accelerator=type=nvidia-tesla-t4,count=1 \
-      --metadata=install-nvidia-driver=True \
-      --preemptible \
-      --container-image="$CLOUD_IMAGE_TAG" \
-      --container-ports=443 \
-      --tags=http-server || {
-          echo "Failed to create GCE instance."
-          exit 1
-      }
+    echo "Checking if instance ${INSTANCE_NAME} already exists..."
+    if gcloud compute instances describe "${INSTANCE_NAME}" --zone="${REGION}-a" &>/dev/null; then
+        echo "Instance ${INSTANCE_NAME} already exists. Updating it with the new container image..."
+        gcloud compute instances update-container "${INSTANCE_NAME}" \
+          --zone="${REGION}-a" \
+          --container-image="$CLOUD_IMAGE_TAG" || {
+              echo "Failed to update GCE instance container."
+              exit 1
+          }
+          
+        # Update metadata if needed
+        if [ ! -z "$DOMAIN_NAME" ]; then
+            echo "Updating instance metadata..."
+            METADATA="domain-name=$DOMAIN_NAME,cert-name=$CERT_NAME"
+            gcloud compute instances add-metadata "${INSTANCE_NAME}" \
+              --zone="${REGION}-a" \
+              --metadata="$METADATA" || {
+                  echo "Failed to update instance metadata."
+                  # Not exiting here as this is not critical
+              }
+        fi
+        
+        echo "Instance updated successfully!"
+    else
+        echo "Creating new instance ${INSTANCE_NAME}..."
+        # Create a GCE instance running the container
+        if [ "$MODE" == "gpu" ]; then
+            # GPU mode: include accelerator flag
+            ACCEL_FLAGS="--accelerator=type=nvidia-tesla-t4,count=1 --metadata=install-nvidia-driver=True"
+        else
+            # CPU mode: no GPU accelerator flags
+            ACCEL_FLAGS=""
+        fi
+
+        # Create metadata for SSL configuration
+        METADATA="startup-script=echo 'Container is starting with SSL configuration'"
+        if [ ! -z "$DOMAIN_NAME" ]; then
+            METADATA="$METADATA,domain-name=$DOMAIN_NAME,cert-name=$CERT_NAME"
+        fi
+        
+        # Increase boot disk size to address performance warning
+        echo "Creating a GCE instance with a 200GB boot disk to ensure good I/O performance..."
+        gcloud compute instances create-with-container "${INSTANCE_NAME}" \
+          --zone="${REGION}-a" \
+          $ACCEL_FLAGS \
+          --boot-disk-size=200GB \
+          --preemptible \
+          --container-image="$CLOUD_IMAGE_TAG" \
+          --metadata="$METADATA" \
+          --scopes=cloud-platform \
+          --tags=http-server || {
+              echo "Failed to create GCE instance."
+              exit 1
+          }
+    fi
 
     echo "Deployment successful!"
-    # Retrieve the external IP of the instance
     EXTERNAL_IP=$(gcloud compute instances describe "${INSTANCE_NAME}" --zone="${REGION}-a" --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
-    echo "Your application is available via HTTPS at: https://${EXTERNAL_IP}"
+    
+    if [ ! -z "$DOMAIN_NAME" ]; then
+        echo "Your application will be available via HTTPS at: https://${DOMAIN_NAME}"
+        echo "Please ensure your DNS is configured to point to: $EXTERNAL_IP"
+    else
+        echo "Your application is available at: https://${EXTERNAL_IP}"
+        echo "Note: Using self-signed certificates - you will need to accept browser warnings."
+    fi
+    
     echo "Use 'gcloud compute ssh ${INSTANCE_NAME} --zone=${REGION}-a' to access the instance if needed."
 fi

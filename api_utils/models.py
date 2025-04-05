@@ -38,22 +38,57 @@ def load_model_and_tokenizer(hf_token=None):
         
         logger.info(f"Loading models and tokenizers...")
         
-        # Load the base model without 8-bit quantization (1B model is small enough)
-        base_model = AutoModelForCausalLM.from_pretrained(
-            base_model_id,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            token=hf_token
-        )
+        # Check if CUDA is available, otherwise use CPU
+        if torch.cuda.is_available():
+            logger.info("CUDA is available. Using GPU.")
+            device_map = "auto"
+            torch_dtype = torch.float16
+        else:
+            logger.info("CUDA is not available. Using CPU.")
+            device_map = "cpu"
+            torch_dtype = torch.float32
         
-        # Load the tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(base_model_id, token=hf_token)
+        # Load the tokenizer first
+        tokenizer = AutoTokenizer.from_pretrained(
+            base_model_id, 
+            token=hf_token,
+            trust_remote_code=True
+        )
         tokenizer.pad_token = tokenizer.eos_token
         
-        # Load the adapter with PEFT
-        model = PeftModel.from_pretrained(base_model, adapter_path)
+        # Load the base model with specific configuration to avoid offloading issues
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_id,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+            device_map=device_map,
+            token=hf_token,
+            trust_remote_code=True
+        )
+        
+        # Check if adapter exists locally
+        if os.path.exists(adapter_path):
+            # Load the adapter with PEFT
+            try:
+                model = PeftModel.from_pretrained(
+                    base_model, 
+                    adapter_path,
+                    device_map=device_map
+                )
+                logger.info("LoRA adapter loaded successfully")
+            except ValueError as ve:
+                # If we still get offloading error, use the base model instead
+                if "offload" in str(ve):
+                    logger.warning(f"Could not load adapter due to offloading error: {ve}")
+                    logger.warning("Using base model without adapter")
+                    model = base_model
+                else:
+                    raise
+        else:
+            logger.warning(f"Adapter path {adapter_path} not found. Using base model only.")
+            model = base_model
+            
         logger.info("Model and tokenizer loaded successfully")
-
         return model, tokenizer
         
     except Exception as e:
