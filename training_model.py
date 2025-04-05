@@ -8,6 +8,7 @@ import json
 import logging
 import glob
 import random
+import argparse
 from typing import List, Dict, Any, Optional, Union
 
 import torch
@@ -40,7 +41,7 @@ OUTPUT_DIR = "./satoshi-ai-model"
 TRAINING_DATA_DIR = "./training-data/output"
 PEFT_CONFIG_PATH = os.path.join(TRAINING_DATA_DIR, "persona_peft_config.json")
 SEED = 42
-MAX_SEQ_LENGTH = 1024  # Reduced from 2048 to save memory
+MAX_SEQ_LENGTH = 2048  # Restored to full sequence length for 40GB RAM
 
 # Set random seeds for reproducibility
 random.seed(SEED)
@@ -131,12 +132,12 @@ def prepare_training_data(dataset: Dataset, tokenizer) -> Dataset:
     # Apply the persona transformation
     persona_dataset = dataset.map(add_satoshi_persona, batched=True)
     
-    # Tokenize the dataset with reduced sequence length
+    # Tokenize the dataset with restored full sequence length
     def tokenize_function(examples):
         return tokenizer(
             examples["text"],
             truncation=True,
-            max_length=MAX_SEQ_LENGTH,  # Using reduced sequence length to save memory
+            max_length=MAX_SEQ_LENGTH,  # Using full sequence length with 40GB RAM
             padding="max_length",
         )
     
@@ -144,17 +145,29 @@ def prepare_training_data(dataset: Dataset, tokenizer) -> Dataset:
         tokenize_function,
         batched=True,
         remove_columns=["source"],
-        num_proc=1,  # Using a single process to avoid OOM errors
+        num_proc=4,  # Increased from 1 to 4 for faster processing
     )
     
     logger.info(f"Prepared and tokenized {len(tokenized_dataset)} examples for training")
     return tokenized_dataset
 
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Satoshi AI Fine-Tuning Script")
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to a checkpoint to resume training from",
+    )
+    return parser.parse_args()
+
 def main():
     """Main function to execute the fine-tuning process."""
+    args = parse_args()
     logger.info("Starting Satoshi AI fine-tuning process")
     
-    # Check for CUDA availability
+    # Check for CUDA availability and memory
     if torch.cuda.is_available():
         logger.info(f"CUDA is available. Using device: {torch.cuda.get_device_name(0)}")
         logger.info(f"Total GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
@@ -226,9 +239,9 @@ def main():
     # Set up training arguments from PEFT config
     training_config = peft_config["training_args"]
     
-    # Override batch size with smaller values to prevent OOM errors
-    batch_size = min(2, training_config["per_device_train_batch_size"])
-    grad_accumulation = max(8, training_config["gradient_accumulation_steps"])
+    # Optimize batch size and gradient accumulation for 40GB RAM
+    batch_size = 8  # Increased from 2 to 8 for 40GB RAM
+    grad_accumulation = 4  # Reduced from 8 to 4 for faster updates
     
     logger.info(f"Using batch size of {batch_size} with gradient accumulation steps of {grad_accumulation}")
     
@@ -237,10 +250,10 @@ def main():
         output_dir=OUTPUT_DIR,
         learning_rate=training_config["learning_rate"],
         num_train_epochs=training_config["num_train_epochs"],
-        per_device_train_batch_size=batch_size,  # Reduced batch size
-        per_device_eval_batch_size=batch_size,   # Reduced eval batch size
-        gradient_accumulation_steps=grad_accumulation,  # Increased gradient accumulation
-        gradient_checkpointing=True,  # Always use gradient checkpointing
+        per_device_train_batch_size=batch_size,  # Increased batch size
+        per_device_eval_batch_size=batch_size,   # Increased eval batch size
+        gradient_accumulation_steps=grad_accumulation,  # Reduced gradient accumulation
+        gradient_checkpointing=True,  # Keep gradient checkpointing for memory efficiency
         warmup_ratio=training_config["warmup_ratio"],
         weight_decay=training_config["weight_decay"],
         fp16=training_config["fp16"],
@@ -249,12 +262,12 @@ def main():
         save_strategy="epoch",
         eval_strategy="epoch",  # Updated from evaluation_strategy
         load_best_model_at_end=True,
-        save_total_limit=2,  # Reduced to save disk space
+        save_total_limit=3,  # Slightly increased to keep more checkpoints
         report_to="tensorboard",
-        # Additional memory-saving settings
+        # Optimized settings for 40GB RAM
         optim="adamw_torch_fused",  # Use fused optimizer
         ddp_find_unused_parameters=False,
-        dataloader_num_workers=0,  # Reduce parallel workers
+        dataloader_num_workers=2,  # Increased from 0 to 2
         remove_unused_columns=True,
     )
     
@@ -277,12 +290,29 @@ def main():
     # Free up memory before training
     torch.cuda.empty_cache()
     
-    # Train model
+    # Train model with checkpoint resumption support
     logger.info("Starting training")
     try:
-        # Start training from scratch instead of resuming
-        logger.info("Starting fresh training (not resuming from checkpoint)")
-        trainer.train()
+        checkpoint_path = args.resume_from_checkpoint
+        
+        if checkpoint_path:
+            logger.info(f"Resuming training from checkpoint: {checkpoint_path}")
+            trainer.train(resume_from_checkpoint=checkpoint_path)
+        else:
+            # Check if there's a checkpoint in the output directory
+            checkpoints = glob.glob(os.path.join(OUTPUT_DIR, "checkpoint-*"))
+            if checkpoints:
+                latest_checkpoint = max(checkpoints, key=os.path.getctime)
+                logger.info(f"Found existing checkpoint: {latest_checkpoint}")
+                if input(f"Resume from {latest_checkpoint}? (y/n): ").lower() == 'y':
+                    logger.info(f"Resuming from latest checkpoint: {latest_checkpoint}")
+                    trainer.train(resume_from_checkpoint=latest_checkpoint)
+                else:
+                    logger.info("Starting fresh training (not resuming from checkpoint)")
+                    trainer.train()
+            else:
+                logger.info("No checkpoints found. Starting fresh training.")
+                trainer.train()
     except Exception as e:
         logger.error(f"Error during training: {e}")
         # Try to save partial progress if possible
