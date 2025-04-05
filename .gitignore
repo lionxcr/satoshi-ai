@@ -1,0 +1,89 @@
+# Llama-3.2-1B Fine-tuning Project .gitignore
+
+# Ignore everything by default
+*
+!*/
+!.gitignore
+
+# Allow only the fine-tuned model output files
+# Adjust these patterns based on how your specific model files are named
+!model-output/**/*.gguf
+!model-output/**/*.safetensors
+!model-output/**/*.bin
+!model-output/**/*.pt
+!model-output/**/*.pth
+!model-output/**/*.ckpt
+!model-output/**/adapter_config.json
+!model-output/**/config.json
+
+# Keep README and license files
+!README.md
+!LICENSE*
+
+# Keep Python source code
+!*.py
+!requirements.txt
+
+# Explicitly ignore cloned repositories in training-data
+training-data/bips/
+training-data/bitcoinbook/
+training-data/lnbook/
+training-data/bitcoin/
+training-data/lnd/
+
+# Ignore output directory
+/output/
+
+# Python-specific ignores
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Datasets (typically large)
+data/
+datasets/
+*.csv
+*.json
+*.jsonl
+*.txt
+*.tsv
+
+# Training artifacts
+runs/
+checkpoints/
+wandb/
+logs/
+tensorboard/
+.cache/
+.huggingface/
+
+# Virtual environments
+venv/
+.env/
+.venv/
+env/
+ENV/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store 
