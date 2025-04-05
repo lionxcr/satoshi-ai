@@ -13,7 +13,7 @@ from api_utils.validation import evaluate_response_quality, validate_response_st
 from api_utils.persona import generate_satoshi_persona, get_satoshi_persona, get_satoshi_system_prompt
 from api_utils.models import load_model_and_tokenizer, initialize_openai_client
 from api_utils.prompts import get_response_regeneration_prompt, get_image_prompt, get_llm_prompt_for_image, get_bitcoin_recommendations_prompt, get_openai_enhanced_response_prompt
-from api_utils.openai_helpers import call_openai, call_openai_with_fallback, extract_json_from_text
+from api_utils.openai_helpers import call_openai_with_fallback
 from api_utils.fallback import handle_response_truncation, process_fallback_response, generate_fallback_recommendations
 from api_utils.image import extract_core_description, create_text_image, download_image
 
@@ -562,16 +562,6 @@ def generate_response(request: GenerationRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/get_full_response/{response_id}")
-def get_full_response(response_id: str):
-    """
-    Endpoint to retrieve a full response by ID.
-    This can be used when responses are too large for headers.
-    """
-    # Implement storage and retrieval logic here
-    # For now, just a placeholder
-    return {"message": "Full response retrieval not yet implemented"}
-
 @app.post("/admin/refresh_persona")
 def refresh_persona():
     """Admin endpoint to refresh the cached Satoshi persona."""
@@ -630,7 +620,7 @@ def generate_recommendations(openai_client, query, satoshi_persona):
         logger.error(f"Error generating recommendations: {e}")
         return generate_fallback_recommendations("")
 
-def generate_image_from_query(openai_client, query, model="gpt-4o-mini"):
+def generate_image_from_query(openai_client, query):
     """Generate an image based on user query using the OpenAI API."""
     try:
         logger.info(f"Generating image for query: {query}")
