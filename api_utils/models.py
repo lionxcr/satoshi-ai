@@ -39,6 +39,7 @@ def load_model_and_tokenizer(hf_token=None):
         logger.info(f"Loading models and tokenizers...")
         
         # Check if CUDA is available, otherwise use CPU
+        
         if torch.cuda.is_available():
             logger.info("CUDA is available. Using GPU.")
             device_map = "auto"

@@ -12,8 +12,12 @@
 !.env.example
 !run.sh
 
-# Allow satoshi-ai-model files
+# Allow ALL satoshi-ai-model files - this needs to take precedence
 !satoshi-ai-model/**/*
+!satoshi-ai-model/adapter/**/*
+!satoshi-ai-model/**/*.json
+!satoshi-ai-model/**/*.safetensors
+!satoshi-ai-model/**/*.bin
 
 # Allow only the fine-tuned model output files
 # Adjust these patterns based on how your specific model files are named
@@ -67,11 +71,18 @@ var/
 # Datasets (typically large)
 data/
 datasets/
-*.csv
-*.json
-*.jsonl
-*.txt
-*.tsv
+# Don't ignore these in satoshi-ai-model
+/**.csv
+/**.json
+/**.jsonl
+/**.txt
+/**.tsv
+# But allow them in satoshi-ai-model
+!satoshi-ai-model/**/*.csv
+!satoshi-ai-model/**/*.json
+!satoshi-ai-model/**/*.jsonl
+!satoshi-ai-model/**/*.txt
+!satoshi-ai-model/**/*.tsv
 
 # Training artifacts
 runs/
